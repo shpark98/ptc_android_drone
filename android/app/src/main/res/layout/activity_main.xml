@@ -1,0 +1,469 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- ARCore session (renders black, behind everything) -->
+    <android.opengl.GLSurfaceView
+        android:id="@+id/gl_surface_view"
+        android:layout_width="1dp"
+        android:layout_height="1dp" />
+
+    <!-- Camera bitmap for overlay mode (full screen) -->
+    <ImageView
+        android:id="@+id/camera_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitCenter"
+        android:background="#000000"
+        android:visibility="gone" />
+
+    <!-- Split view container (for side-by-side mode) -->
+    <LinearLayout
+        android:id="@+id/split_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="horizontal"
+        android:visibility="visible">
+
+        <!-- Left side (camera bitmap) -->
+        <ImageView
+            android:id="@+id/camera_split"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:scaleType="fitCenter"
+            android:background="#000000" />
+
+        <!-- Right side (depth visualization) -->
+        <com.prdepth.android.DepthVisualizerView
+            android:id="@+id/depth_visualizer_split"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="#000000" />
+    </LinearLayout>
+
+    <!-- Compare view container (model depth vs ARCore depth) -->
+    <LinearLayout
+        android:id="@+id/compare_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <!-- Left side (model depth) -->
+        <com.prdepth.android.DepthVisualizerView
+            android:id="@+id/depth_visualizer_compare_model"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="#000000" />
+
+        <!-- Right side (ARCore depth) -->
+        <com.prdepth.android.DepthVisualizerView
+            android:id="@+id/depth_visualizer_compare_arcore"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="#000000" />
+    </LinearLayout>
+
+    <!-- Overlay mode depth visualization (full screen, semi-transparent) -->
+    <com.prdepth.android.DepthVisualizerView
+        android:id="@+id/depth_visualizer_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:alpha="0.7"
+        android:visibility="gone" />
+
+    <!-- Point cloud 3D view (full screen) -->
+    <com.prdepth.android.PointCloudView
+        android:id="@+id/point_cloud_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- Loading overlay -->
+    <LinearLayout
+        android:id="@+id/loading_overlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="32dp"
+        android:background="#DD000000"
+        android:visibility="gone"
+        android:layout_gravity="center">
+
+        <ProgressBar
+            android:id="@+id/loading_progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="200dp"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="0" />
+
+        <TextView
+            android:id="@+id/loading_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="@string/loading_model"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/loading_percent"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="0%"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <!-- Top buttons row -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_gravity="top|start"
+        android:layout_margin="16dp">
+
+        <Button
+            android:id="@+id/btn_toggle_mode"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Split"
+            android:textSize="11sp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:background="#88000000"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/btn_toggle_refine"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="Mono"
+            android:textSize="11sp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:background="#88000000"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/btn_settings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:text="Params"
+            android:textSize="11sp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:background="#88000000"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
+
+    <!-- Stats panel (bottom-right, floating) -->
+    <LinearLayout
+        android:id="@+id/stats_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="12dp"
+        android:background="#CC000000"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingBottom="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="GT Pose:"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp"
+                android:paddingEnd="8dp" />
+
+            <Switch
+                android:id="@+id/switch_gt_pose"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="false" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/text_fps"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/fps_default"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <TextView
+            android:id="@+id/text_baseline"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/baseline_default"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <TextView
+            android:id="@+id/text_rotation"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/rotation_default"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <TextView
+            android:id="@+id/text_matches"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/matches_default"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <TextView
+            android:id="@+id/text_absrel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="AbsRel: --"
+            android:textColor="#88FF88"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+
+        <TextView
+            android:id="@+id/text_tae"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="TAE: --"
+            android:textColor="#88FF88"
+            android:textSize="13sp"
+            android:paddingTop="4dp" />
+    </LinearLayout>
+
+    <!-- Parameter Panel (scrollable, right side overlay) -->
+    <ScrollView
+        android:id="@+id/params_panel"
+        android:layout_width="280dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end"
+        android:background="#DD000000"
+        android:padding="12dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="PR-Depth Parameters"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:paddingBottom="12dp" />
+
+            <TextView android:id="@+id/label_ransac"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RANSAC iters: 50"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp" />
+            <SeekBar android:id="@+id/seek_ransac"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="500"
+                android:progress="50" />
+
+            <TextView android:id="@+id/label_max_depth"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Max depth: 80m"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_max_depth"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="200"
+                android:progress="80" />
+
+            <TextView android:id="@+id/label_vmax"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Vmax (viz): 20m"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_vmax"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="200"
+                android:progress="20" />
+
+            <TextView android:id="@+id/label_lambda"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Lambda forget: 0.35"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_lambda"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="35" />
+
+            <TextView android:id="@+id/label_chi2"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Chi2 soft: 6.6"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_chi2"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="200"
+                android:progress="66" />
+
+            <TextView android:id="@+id/label_var_floor"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Var floor: 0.003"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_var_floor"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="3" />
+
+            <TextView android:id="@+id/label_min_baseline"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Min baseline: 0.05m"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_min_baseline"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="17" />
+
+            <TextView android:id="@+id/label_sky_thresh"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Sky mask: 1e-7 (0=off)"
+                android:textColor="#CCCCCC"
+                android:textSize="12sp"
+                android:paddingTop="8dp" />
+            <SeekBar android:id="@+id/seek_sky_thresh"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="1" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Toggles"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:paddingTop="16dp"
+                android:paddingBottom="8dp" />
+
+            <Switch android:id="@+id/switch_segmentation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Segmentation"
+                android:textColor="#CCCCCC"
+                android:checked="true"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_iterative"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Iterative Refinement"
+                android:textColor="#CCCCCC"
+                android:checked="false"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_fb_consistency"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="FB Consistency"
+                android:textColor="#CCCCCC"
+                android:checked="false"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_timing"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Timing Logs"
+                android:textColor="#CCCCCC"
+                android:checked="true"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_show_flow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Show Flow"
+                android:textColor="#CCCCCC"
+                android:checked="false"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_show_tri_depth"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Show Tri Depth"
+                android:textColor="#CCCCCC"
+                android:checked="false"
+                android:paddingBottom="4dp" />
+
+            <Switch android:id="@+id/switch_rgb_color"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="3D RGB Color"
+                android:textColor="#CCCCCC"
+                android:checked="false"
+                android:paddingBottom="4dp" />
+
+            <Button
+                android:id="@+id/btn_reset_pipeline"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Reset Pipeline"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>

@@ -1,0 +1,75 @@
+segmentation:
+  edge_method: sobel
+  canny_thresh: [0, 30]
+  seg_method: felzenszwalb
+  seg_params:
+    sigma: 0.0
+    scale: 400
+    min_size: 2500
+  use_rgb: true
+  wrgb: 1.5
+  wgrad: 1.3
+  wx: 0.5
+  grad_power: 0.6
+  seg_down: 1.9
+
+motion_field:
+  min_points: 100
+  ransac_max_iters: 500
+  ransac_min_sample: 7
+  ransac_thresh_ratio: 0.3      # TUNED: 0.1 → 0.3 (더 많은 inlier 허용)
+  ransac_thr_min: 0.0001
+  ransac_thr_max: 0.3
+  inlier_target_min: 0.2
+  inlier_target_max: 0.6
+  shrink_factor: 0.8
+  grow_factor: 1.2
+  max_shrink_steps: 15
+
+  lo_irls_iters: 4
+  huber_delta_rel: 0.5
+
+  use_angle_gate: true
+  ang_min_flow_px: 0.1
+  ang_thr_mode: 'mad' # 'fixed' or 'mad'
+  ang_mad_k: 2.5                # TUNED: 0.5 → 2.5 (각도 게이트 완화)
+  ang_thr_deg_fix: 15
+
+  min_cond_ratio: 1.0e-5
+  mad_scale: 15.5
+  res_thresh: 15.5
+  lambda_cell: 2.0
+
+  depth_bins: 5
+  min_flow_px: 1.0              # TUNED: 0.1 → 1.0 (작은 flow 제외)
+  margin_x_pct: 0.05 # 좌우 5%
+  margin_y_pct: 0.2 # 상하 10%
+  show_angle_bins: true
+
+refinement:
+  debug: false
+
+  use_baseline_guard: true
+  min_baseline_for_correction: 0.1   # [m]
+  max_points : 300
+  rpx_variance:
+    tau0_deg: 0.1        # 기준 각도(도). 없으면 기존 tau0(px)로 자동 변환
+    sigma2_at_tau: 1.0
+    var_floor: 1.0e-3
+    var_cap: 1.0e+3
+
+  consistency:
+    alpha: 0.9
+
+  fusion:
+    chi2_soft: 5.0
+    chi2_hard: 10.828
+    kcap_floor: 0.15
+    kC_R: 0
+    gate_loosen: 0.8
+    min_var: 1.0e-3
+    lambda_forget: 0.05
+
+  gating:
+    rpx_mad_mul: 2.5          # tau_gate = 1.4826*MAD * rpx_mad_mul
+    diff_mad_mul: 2.5         # kappa = 1.4826*MAD(diff) * diff_mad_mul

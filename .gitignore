@@ -1,0 +1,64 @@
+# Build artifacts
+/android/app/build/
+/android/app/.cxx/
+/android/.gradle/
+/android/build/
+/android/gradle-8.2/
+/android/gradle-8.2-bin.zip
+/cpp/build/
+
+# Model weights (too large for git)
+/weights/
+
+# Model assets (too large for git, download separately)
+/android/app/src/main/assets/*.dlc
+/android/app/src/main/assets/*.onnx
+/android/app/src/main/assets/*.tflite
+
+# Gradle distribution (download automatically)
+/android/gradle/wrapper/gradle-*.zip*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Android
+local.properties
+*.apk
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Native build intermediates
+*.o
+*.a
+
+# Native libraries (pre-built QNN libs bundled in jniLibs)
+/android/app/src/main/jniLibs/
+
+# Bundled libraries (download separately)
+/android/app/libs/eigen3/
+/android/app/libs/arm64-v8a/
+/android/app/libs/*.aar
+/android/app/libs/*.jar
+
+# OpenCV SDK (large, download separately)
+/android/opencv-android-sdk/
+
+# Compile logs
+compile_*.txt
+
+# Data files (too large for git)
+/dataloader/gt_poses/
+/dataloader/.cache/
+/tests/data/
