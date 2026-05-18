@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.prdepth.android"
+    namespace = "com.ptcdepth.android"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.prdepth.android"
+        applicationId = "com.ptcdepth.android"
         minSdk = 26  // ARCore minimum requirement
         targetSdk = 34
         versionCode = 1
@@ -70,6 +70,12 @@ android {
             useLegacyPackaging = true
         }
     }
+
+    // Don't compress the ONNX graph or its external weights so they can be
+    // memory-mapped from the APK / extracted to cache without re-inflating.
+    androidResources {
+        noCompress += listOf("onnx", "data", "bin", "dlc")
+    }
 }
 
 dependencies {
@@ -82,11 +88,11 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.3.0")
     implementation("androidx.camera:camera-view:1.3.0")
 
-    // ONNX Runtime for Depth Anything (CPU fallback)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.16.0")
-
-    // QNN native GPU backend is handled via CMake + dlopen (libs/arm64-v8a/*.so)
-    // Removed TFLite/QNN delegate/SNPE to avoid .so version conflicts with QNN SDK v2.26
+    // ONNX Runtime with QNN Execution Provider — matches AI Hub's published
+    // 22.8 ms benchmark setup. Uses our shipped libQnnHtp.so + Hexagon V79
+    // skel from app/libs/arm64-v8a/.
+    // Use the same ORT version AI Hub reports for the 22.8 ms benchmark.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android-qnn:1.24.3")
 
     // Kotlin & AndroidX
     implementation("androidx.core:core-ktx:1.12.0")

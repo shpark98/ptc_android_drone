@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">PR-Depth</string>
+    <string name="app_name">PTC-Depth</string>
     <string name="use_arcore_pose">Use ARCore Pose (GT)</string>
     <string name="fps_default">FPS: --</string>
-    <string name="baseline_default">Baseline: --</string>
-    <string name="rotation_default">Rotation: --</string>
-    <string name="matches_default">Matches: -- / Valid: --</string>
+    <string name="baseline_default">B: --</string>
+    <string name="rotation_default">R: --</string>
+    <string name="matches_default">Mono</string>
     <string name="loading_model">모델 로딩 중...</string>
 </resources>

@@ -169,21 +169,21 @@ bool QnnDepthEstimator::setupPerfConfig() {
     dcvsConfig.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
     dcvsConfig.dcvsV3Config.contextId = m_powerConfigId;
     dcvsConfig.dcvsV3Config.setDcvsEnable = 1;
-    dcvsConfig.dcvsV3Config.dcvsEnable = 0;  // Disable DCVS (lock to max clocks)
+    dcvsConfig.dcvsV3Config.dcvsEnable = 1;  // Enable DCVS (dynamic scaling for thermal sustainability)
     dcvsConfig.dcvsV3Config.powerMode =
         QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
     dcvsConfig.dcvsV3Config.setSleepLatency = 1;
     dcvsConfig.dcvsV3Config.sleepLatency = 40;  // 40us sleep latency
     dcvsConfig.dcvsV3Config.setSleepDisable = 1;
-    dcvsConfig.dcvsV3Config.sleepDisable = 1;  // Disable sleep
+    dcvsConfig.dcvsV3Config.sleepDisable = 0;  // Allow sleep for thermal management
     dcvsConfig.dcvsV3Config.setBusParams = 1;
-    dcvsConfig.dcvsV3Config.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_TURBO;
-    dcvsConfig.dcvsV3Config.busVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
-    dcvsConfig.dcvsV3Config.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
+    dcvsConfig.dcvsV3Config.busVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
+    dcvsConfig.dcvsV3Config.busVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvsConfig.dcvsV3Config.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO;
     dcvsConfig.dcvsV3Config.setCoreParams = 1;
-    dcvsConfig.dcvsV3Config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_TURBO;
-    dcvsConfig.dcvsV3Config.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
-    dcvsConfig.dcvsV3Config.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO_PLUS;
+    dcvsConfig.dcvsV3Config.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_NOM_PLUS;
+    dcvsConfig.dcvsV3Config.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvsConfig.dcvsV3Config.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO;
 
     // Configure RPC polling for lower latency (V69+)
     QnnHtpPerfInfrastructure_PowerConfig_t rpcPollingConfig;
@@ -217,7 +217,7 @@ bool QnnDepthEstimator::setupPerfConfig() {
 }
 
 bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
-                                    const std::string& dlcPath) {
+                                    const std::string& modelPath) {
     if (m_initialized) {
         LOGI("Already initialized");
         return true;
@@ -225,7 +225,14 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
 
     LOGI("Initializing QNN Depth Estimator (HTP backend)...");
     LOGI("  Native lib dir: %s", nativeLibDir.c_str());
-    LOGI("  DLC path: %s", dlcPath.c_str());
+    LOGI("  Model path: %s", modelPath.c_str());
+
+    // Branch on file extension: `.bin` = pre-compiled QNN context binary (fast
+    // path — matches AI Hub's published latency). `.dlc` = generic Deep Learning
+    // Container, compiled at runtime via libQnnModelDlc.so (slower fallback).
+    m_isContextBinary = (modelPath.size() >= 4 &&
+                         modelPath.compare(modelPath.size() - 4, 4, ".bin") == 0);
+    LOGI("  Model format: %s", m_isContextBinary ? "QNN context binary" : "DLC");
 
     // Set ADSP_LIBRARY_PATH so HTP can find skel libraries
     std::string adspPath = nativeLibDir + ";/dsp";
@@ -301,7 +308,19 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
         LOGI("HTP perf config failed (non-fatal), continuing with defaults");
     }
 
-    // 6. Create context
+    // 6. Diverge between context-binary path (fast) and DLC compose path (slow)
+    if (m_isContextBinary) {
+        if (!initFromContextBinary(nativeLibDir, modelPath)) {
+            LOGE("Context-binary load failed");
+            return false;
+        }
+        m_initialized = true;
+        LOGI("QNN Depth Estimator initialized successfully (context-binary path)");
+        return true;
+    }
+
+    // ── DLC fallback path ───────────────────────────────────────────────────
+    // Create empty context first, then compose graphs into it from the DLC.
     if (!m_qnnFn.contextCreate) {
         LOGE("contextCreate is null");
         return false;
@@ -331,24 +350,24 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
 
     // 8. Compose graphs from DLC
     {
-        FILE* fp = fopen(dlcPath.c_str(), "rb");
+        FILE* fp = fopen(modelPath.c_str(), "rb");
         if (!fp) {
-            LOGE("Cannot open DLC file: %s (errno=%d: %s)", dlcPath.c_str(), errno, strerror(errno));
+            LOGE("Cannot open DLC file: %s (errno=%d: %s)", modelPath.c_str(), errno, strerror(errno));
             return false;
         }
         fseek(fp, 0, SEEK_END);
         long fileSize = ftell(fp);
         fclose(fp);
-        LOGI("DLC file verified: %s (%ld bytes)", dlcPath.c_str(), fileSize);
+        LOGI("DLC file verified: %s (%ld bytes)", modelPath.c_str(), fileSize);
     }
 
-    LOGI("Composing graphs from DLC: %s", dlcPath.c_str());
+    LOGI("Composing graphs from DLC: %s", modelPath.c_str());
     auto modelErr = composeGraphs(
         m_backendHandle,
         m_qnnFn,
         m_contextHandle,
         nullptr,
-        dlcPath.c_str(),
+        modelPath.c_str(),
         0,
         &m_graphsInfo,
         &m_numGraphs,
@@ -367,11 +386,50 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
         return false;
     }
 
-    // 9. Finalize graphs for HTP execution
+    // 9. Apply HTP graph config (FP16 precision + O3 optimization) and finalize.
+    //
+    // Without these the HTP backend keeps the model at FP32 with the default
+    // (lowest) optimization level — yielding ~85ms infer for Depth-Anything-V2
+    // on Hexagon V79. AI Hub's published 22.8ms benchmark on the same model
+    // runs via ORT-QNN, which under the hood compiles to FP16/O3. Matching that
+    // configuration here closes most of the gap.
+    QnnHtpGraph_CustomConfig_t precisionCustom;
+    memset(&precisionCustom, 0, sizeof(precisionCustom));
+    precisionCustom.option    = QNN_HTP_GRAPH_CONFIG_OPTION_PRECISION;
+    precisionCustom.precision = QNN_PRECISION_FLOAT16;
+
+    QnnGraph_Config_t precisionCfg;
+    precisionCfg.option       = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+    precisionCfg.customConfig = &precisionCustom;
+
+    QnnHtpGraph_CustomConfig_t optCustom;
+    memset(&optCustom, 0, sizeof(optCustom));
+    optCustom.option                       = QNN_HTP_GRAPH_CONFIG_OPTION_OPTIMIZATION;
+    optCustom.optimizationOption.type      = QNN_HTP_GRAPH_OPTIMIZATION_TYPE_FINALIZE_OPTIMIZATION_FLAG;
+    optCustom.optimizationOption.floatValue = 3.0f;  // O3 — max finalize-time optimization
+
+    QnnGraph_Config_t optCfg;
+    optCfg.option       = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+    optCfg.customConfig = &optCustom;
+
+    const QnnGraph_Config_t* graphConfigs[] = { &precisionCfg, &optCfg, nullptr };
+
     for (uint32_t i = 0; i < m_numGraphs; ++i) {
         auto* gi = m_graphsInfo[i];
         LOGI("Graph[%u]: name='%s', inputs=%u, outputs=%u",
              i, gi->graphName, gi->numInputTensors, gi->numOutputTensors);
+
+        if (m_qnnFn.graphSetConfig) {
+            err = m_qnnFn.graphSetConfig(gi->graph, graphConfigs);
+            if (err != QNN_SUCCESS) {
+                LOGE("graphSetConfig failed for '%s': %lu (non-fatal, continuing with defaults)",
+                     gi->graphName, (unsigned long)err);
+            } else {
+                LOGI("Graph '%s' configured: precision=FLOAT16, optimization=O3", gi->graphName);
+            }
+        } else {
+            LOGE("graphSetConfig is null — falling back to backend defaults");
+        }
 
         if (!m_qnnFn.graphFinalize) {
             LOGE("graphFinalize is null");
@@ -383,6 +441,7 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
             return false;
         }
         LOGI("Graph '%s' finalized for HTP", gi->graphName);
+        if (i == 0) m_graphHandle = gi->graph;  // unify with context-binary path
     }
 
     // 10. Setup execution tensor buffers
@@ -407,6 +466,256 @@ bool QnnDepthEstimator::initialize(const std::string& nativeLibDir,
     } else {
         LOGI("  Output: float32");
     }
+    return true;
+}
+
+// Load a pre-compiled QNN context binary (.bin) — the fast path. Matches the
+// approach Qualcomm AI Hub uses to hit its published latency numbers (~22ms for
+// Depth-Anything-V2 on Galaxy S25). Skips the runtime DLC compose/finalize work
+// entirely; the .bin already contains a finalized graph tuned for the target
+// SoC.
+bool QnnDepthEstimator::initFromContextBinary(const std::string& nativeLibDir,
+                                              const std::string& binPath) {
+    // 1. Load libQnnSystem.so (separate from the HTP backend lib).
+    std::string sysLibPath = nativeLibDir + "/libQnnSystem.so";
+    m_systemLib = dlopen(sysLibPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!m_systemLib) {
+        LOGE("Failed to load libQnnSystem.so: %s", dlerror());
+        return false;
+    }
+    LOGI("Loaded libQnnSystem.so");
+
+    typedef Qnn_ErrorHandle_t (*SysGetProvidersFn_t)(
+        const QnnSystemInterface_t*** providerList, uint32_t* numProviders);
+    auto sysGetProviders = reinterpret_cast<SysGetProvidersFn_t>(
+        dlsym(m_systemLib, "QnnSystemInterface_getProviders"));
+    if (!sysGetProviders) {
+        LOGE("QnnSystemInterface_getProviders not found");
+        return false;
+    }
+
+    const QnnSystemInterface_t** sysProviders = nullptr;
+    uint32_t numSysProviders = 0;
+    if (sysGetProviders(&sysProviders, &numSysProviders) != QNN_SUCCESS ||
+        numSysProviders == 0) {
+        LOGE("QnnSystemInterface_getProviders failed");
+        return false;
+    }
+    m_sysFn = sysProviders[0]->QNN_SYSTEM_INTERFACE_VER_NAME;
+
+    // 2. Create system context (used only for parsing the .bin's metadata).
+    if (!m_sysFn.systemContextCreate ||
+        m_sysFn.systemContextCreate(&m_sysCtxHandle) != QNN_SUCCESS) {
+        LOGE("systemContextCreate failed");
+        return false;
+    }
+
+    // 3. Read the entire .bin into memory.
+    std::vector<uint8_t> binaryBuffer;
+    {
+        FILE* fp = fopen(binPath.c_str(), "rb");
+        if (!fp) {
+            LOGE("Cannot open context binary: %s", binPath.c_str());
+            return false;
+        }
+        fseek(fp, 0, SEEK_END);
+        long fileSize = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        binaryBuffer.resize(static_cast<size_t>(fileSize));
+        size_t nread = fread(binaryBuffer.data(), 1, fileSize, fp);
+        fclose(fp);
+        if (nread != static_cast<size_t>(fileSize)) {
+            LOGE("Failed to read context binary fully (%zu/%ld)", nread, fileSize);
+            return false;
+        }
+        LOGI("Loaded context binary: %s (%ld bytes)", binPath.c_str(), fileSize);
+    }
+
+    // 4. Extract metadata (graph names + IO tensors) from the binary.
+    const QnnSystemContext_BinaryInfo_t* binaryInfo = nullptr;
+    Qnn_ContextBinarySize_t metadataSize = 0;
+    auto err = m_sysFn.systemContextGetBinaryInfo(
+        m_sysCtxHandle,
+        binaryBuffer.data(),
+        binaryBuffer.size(),
+        &binaryInfo,
+        &metadataSize);
+    if (err != QNN_SUCCESS || binaryInfo == nullptr) {
+        LOGE("systemContextGetBinaryInfo failed: %lu", (unsigned long)err);
+        return false;
+    }
+
+    // Pick the first graph. Handle V1/V2/V3 binary-info layouts.
+    QnnSystemContext_GraphInfo_t* graphs = nullptr;
+    uint32_t numGraphs = 0;
+    const char* socVersion = "?";
+    switch (binaryInfo->version) {
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1:
+            graphs     = binaryInfo->contextBinaryInfoV1.graphs;
+            numGraphs  = binaryInfo->contextBinaryInfoV1.numGraphs;
+            socVersion = binaryInfo->contextBinaryInfoV1.socVersion;
+            break;
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2:
+            graphs     = binaryInfo->contextBinaryInfoV2.graphs;
+            numGraphs  = binaryInfo->contextBinaryInfoV2.numGraphs;
+            socVersion = binaryInfo->contextBinaryInfoV2.socVersion;
+            break;
+        case QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3:
+            graphs     = binaryInfo->contextBinaryInfoV3.graphs;
+            numGraphs  = binaryInfo->contextBinaryInfoV3.numGraphs;
+            socVersion = binaryInfo->contextBinaryInfoV3.socVersion;
+            break;
+        default:
+            LOGE("Unsupported BinaryInfo version: %u", binaryInfo->version);
+            return false;
+    }
+    if (numGraphs == 0 || graphs == nullptr) {
+        LOGE("Context binary contains no graphs");
+        return false;
+    }
+    LOGI("Context binary: socVersion=%s, numGraphs=%u",
+         socVersion ? socVersion : "(null)", numGraphs);
+
+    // Unpack first graph's info (V1/V2/V3).
+    const QnnSystemContext_GraphInfo_t& g0 = graphs[0];
+    const char* graphName = nullptr;
+    Qnn_Tensor_t* inputs = nullptr;  uint32_t numInputs = 0;
+    Qnn_Tensor_t* outputs = nullptr; uint32_t numOutputs = 0;
+    switch (g0.version) {
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1:
+            graphName  = g0.graphInfoV1.graphName;
+            inputs     = g0.graphInfoV1.graphInputs;
+            numInputs  = g0.graphInfoV1.numGraphInputs;
+            outputs    = g0.graphInfoV1.graphOutputs;
+            numOutputs = g0.graphInfoV1.numGraphOutputs;
+            break;
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2:
+            graphName  = g0.graphInfoV2.graphName;
+            inputs     = g0.graphInfoV2.graphInputs;
+            numInputs  = g0.graphInfoV2.numGraphInputs;
+            outputs    = g0.graphInfoV2.graphOutputs;
+            numOutputs = g0.graphInfoV2.numGraphOutputs;
+            break;
+        case QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3:
+            graphName  = g0.graphInfoV3.graphName;
+            inputs     = g0.graphInfoV3.graphInputs;
+            numInputs  = g0.graphInfoV3.numGraphInputs;
+            outputs    = g0.graphInfoV3.graphOutputs;
+            numOutputs = g0.graphInfoV3.numGraphOutputs;
+            break;
+        default:
+            LOGE("Unsupported GraphInfo version: %u", g0.version);
+            return false;
+    }
+    LOGI("Graph: name='%s', inputs=%u, outputs=%u",
+         graphName ? graphName : "(null)", numInputs, numOutputs);
+
+    // 5. Create the actual context from the binary (this is where the model
+    //    actually gets loaded onto the HTP). No regular contextCreate first —
+    //    contextCreateFromBinary owns the resulting handle.
+    if (!m_qnnFn.contextCreateFromBinary) {
+        LOGE("contextCreateFromBinary is null");
+        return false;
+    }
+    err = m_qnnFn.contextCreateFromBinary(
+        m_backendHandle, m_deviceHandle, /*configs*/ nullptr,
+        binaryBuffer.data(), binaryBuffer.size(),
+        &m_contextHandle, /*profile*/ nullptr);
+    if (err != QNN_SUCCESS) {
+        LOGE("contextCreateFromBinary failed: %lu", (unsigned long)err);
+        return false;
+    }
+    LOGI("Context created from binary");
+
+    // 6. Retrieve the graph handle (the binary's graph is already finalized).
+    if (!m_qnnFn.graphRetrieve) {
+        LOGE("graphRetrieve is null");
+        return false;
+    }
+    err = m_qnnFn.graphRetrieve(m_contextHandle, graphName, &m_graphHandle);
+    if (err != QNN_SUCCESS) {
+        LOGE("graphRetrieve('%s') failed: %lu", graphName, (unsigned long)err);
+        return false;
+    }
+    LOGI("Graph '%s' retrieved (no compose/finalize needed)", graphName);
+
+    // 7. Build execution tensors from the binary's tensor metadata.
+    if (!setupExecutionTensorsFromBinaryInfo(inputs, numInputs, outputs, numOutputs)) {
+        LOGE("Failed to setup execution tensors from binary info");
+        return false;
+    }
+
+    return true;
+}
+
+bool QnnDepthEstimator::setupExecutionTensorsFromBinaryInfo(
+    const Qnn_Tensor_t* inputs, uint32_t numInputs,
+    const Qnn_Tensor_t* outputs, uint32_t numOutputs)
+{
+    m_execInputTensors.resize(numInputs);
+    m_inputBuffers.resize(numInputs);
+    m_inputElementCount = 0;
+    for (uint32_t i = 0; i < numInputs; ++i) {
+        m_execInputTensors[i] = inputs[i];
+        uint32_t tensorSize = calculateTensorSize(inputs[i]);
+        if (tensorSize == 0) { LOGE("Input %u zero size", i); return false; }
+        m_inputBuffers[i].resize(tensorSize, 0);
+
+        QNN_TENSOR_SET_MEM_TYPE(m_execInputTensors[i], QNN_TENSORMEMTYPE_RAW);
+        Qnn_ClientBuffer_t clientBuf = {m_inputBuffers[i].data(), tensorSize};
+        QNN_TENSOR_SET_CLIENT_BUF(m_execInputTensors[i], clientBuf);
+
+        uint32_t rank = QNN_TENSOR_GET_RANK(inputs[i]);
+        uint32_t* dims = QNN_TENSOR_GET_DIMENSIONS(inputs[i]);
+        uint32_t elements = 1;
+        for (uint32_t d = 0; d < rank; ++d) elements *= dims[d];
+        m_inputElementCount += elements;
+
+        std::string dimStr;
+        for (uint32_t d = 0; d < rank; ++d) {
+            if (d > 0) dimStr += "x";
+            dimStr += std::to_string(dims[d]);
+        }
+        LOGI("Input[%u]: name='%s', dims=[%s], dtype=0x%x, bytes=%u",
+             i, QNN_TENSOR_GET_NAME(inputs[i]), dimStr.c_str(),
+             QNN_TENSOR_GET_DATA_TYPE(inputs[i]), tensorSize);
+
+        if (i == 0) m_inputQuant = extractQuantInfo(inputs[i]);
+    }
+
+    m_execOutputTensors.resize(numOutputs);
+    m_outputBuffers.resize(numOutputs);
+    m_outputElementCount = 0;
+    for (uint32_t i = 0; i < numOutputs; ++i) {
+        m_execOutputTensors[i] = outputs[i];
+        uint32_t tensorSize = calculateTensorSize(outputs[i]);
+        if (tensorSize == 0) { LOGE("Output %u zero size", i); return false; }
+        m_outputBuffers[i].resize(tensorSize, 0);
+
+        QNN_TENSOR_SET_MEM_TYPE(m_execOutputTensors[i], QNN_TENSORMEMTYPE_RAW);
+        Qnn_ClientBuffer_t clientBuf = {m_outputBuffers[i].data(), tensorSize};
+        QNN_TENSOR_SET_CLIENT_BUF(m_execOutputTensors[i], clientBuf);
+
+        uint32_t rank = QNN_TENSOR_GET_RANK(outputs[i]);
+        uint32_t* dims = QNN_TENSOR_GET_DIMENSIONS(outputs[i]);
+        uint32_t elements = 1;
+        for (uint32_t d = 0; d < rank; ++d) elements *= dims[d];
+        m_outputElementCount += elements;
+
+        std::string dimStr;
+        for (uint32_t d = 0; d < rank; ++d) {
+            if (d > 0) dimStr += "x";
+            dimStr += std::to_string(dims[d]);
+        }
+        LOGI("Output[%u]: name='%s', dims=[%s], dtype=0x%x, bytes=%u",
+             i, QNN_TENSOR_GET_NAME(outputs[i]), dimStr.c_str(),
+             QNN_TENSOR_GET_DATA_TYPE(outputs[i]), tensorSize);
+
+        if (i == 0) m_outputQuant = extractQuantInfo(outputs[i]);
+    }
+
+    LOGI("Total input elements: %u, output elements: %u",
+         m_inputElementCount, m_outputElementCount);
     return true;
 }
 
@@ -549,10 +858,9 @@ bool QnnDepthEstimator::infer(const float* inputData, float* outputData) {
         memcpy(m_inputBuffers[0].data(), inputData, inputBytes);
     }
 
-    // Execute
-    auto* gi = m_graphsInfo[0];
+    // Execute (m_graphHandle works for both DLC compose and context-binary paths)
     auto err = m_qnnFn.graphExecute(
-        gi->graph,
+        m_graphHandle,
         m_execInputTensors.data(),
         static_cast<uint32_t>(m_execInputTensors.size()),
         m_execOutputTensors.data(),
@@ -746,8 +1054,16 @@ void QnnDepthEstimator::destroy() {
         m_logHandle = nullptr;
     }
 
+    // Free system context handle (context-binary path)
+    if (m_sysCtxHandle && m_sysFn.systemContextFree) {
+        m_sysFn.systemContextFree(m_sysCtxHandle);
+        m_sysCtxHandle = nullptr;
+    }
+
     if (m_modelLib) { dlclose(m_modelLib); m_modelLib = nullptr; }
+    if (m_systemLib) { dlclose(m_systemLib); m_systemLib = nullptr; }
     if (m_backendLib) { dlclose(m_backendLib); m_backendLib = nullptr; }
+    m_graphHandle = nullptr;
 
     m_initialized = false;
     LOGI("QNN Depth Estimator destroyed");

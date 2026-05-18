@@ -1,50 +1,84 @@
 /**
- * JNI Bridge for PR-Depth Android
- * Connects Java/Kotlin to C++ DepthRefinement pipeline.
+ * JNI Bridge for PTC-Depth Android
  *
- * Accepts YUV camera planes directly (same format as QNN bridge) and
- * builds a BGR image using the same rotation+resize mapping as the QNN
- * preprocessor, ensuring perfect spatial alignment between the camera
- * image and QNN depth output.
+ * Connects Java/Kotlin to the PTC-Depth C++ pipeline (ptc_depth::PTCDepth).
+ *
+ * Accepts YUV camera planes directly (same format as QNN bridge) and builds
+ * a grayscale image using the same rotation+resize mapping as the QNN
+ * preprocessor — guaranteeing spatial alignment between camera image and
+ * QNN depth output.
+ *
+ * Real-time optimization preserved from the previous (pr_depth) bridge:
+ *   - prepareFlow(): runs DIS optical flow on the CPU while the NPU is busy
+ *     running depth inference. The result is fed to the next refine() call so
+ *     the C++ pipeline never has to recompute flow synchronously.
  */
 
 #include <jni.h>
 #include <android/log.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 #include <Eigen/Dense>
 #include <memory>
 #include <string>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <omp.h>
 
-#include "pr_depth/depth_refinement.hpp"
+#include "ptc_depth/ptc_depth.hpp"
+#include "ptc_depth/depth_warp.hpp"  // rotation_matrix_to_omega
 
-#define LOG_TAG "PR-Depth-JNI"
+#define LOG_TAG "PTC-Depth-JNI"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
-// Helper functions
+// Pipeline state (one struct per Kotlin DepthRefinementManager instance)
 // ============================================================================
 
-/**
- * Build BGR image from YUV planes using the SAME rotation+resize mapping
- * as the QNN preprocessor. This ensures spatial alignment with QNN depth.
- *
- * Produces a targetW x targetH BGR image at the model's coordinate space.
- */
-static cv::Mat buildBGRFromYUV(
-    const uint8_t* yData, const uint8_t* uData, const uint8_t* vData,
-    int imgW, int imgH, int yRowStride, int uvRowStride, int uvPixelStride,
+struct PipelineHandle {
+    ptc_depth::PTCDepth pipeline;
+
+    // External flow pre-computation state (NPU/CPU pipelining).
+    // Mirrors PTC-Depth's internal prev_img_ — we keep our own so we can run
+    // flow on the CPU before refine() is called.
+    cv::Mat prev_gray;
+    cv::Mat precomputed_flow;
+    bool flow_ready = false;
+    cv::Ptr<cv::DISOpticalFlow> dis_flow;
+
+    // Saved external pose flag for diagnostics.
+    bool last_used_external_pose = false;
+    float last_rotation_angle_deg = 0.0f;
+
+    explicit PipelineHandle(const ptc_depth::PTCDepthConfig& cfg)
+        : pipeline(cfg) {
+        // PRESET_FAST ~3x faster than PRESET_MEDIUM at 480x640. RANSAC inside
+        // PTC-Depth filters most of the noise so the accuracy loss on dense
+        // matches is tolerable.
+        dis_flow = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_FAST);
+        dis_flow->setFinestScale(1);  // skip the finest pyramid level
+        dis_flow->setUseSpatialPropagation(true);
+    }
+};
+
+// ============================================================================
+// YUV → grayscale (with rotation + resize) — identical mapping to QNN bridge
+// ============================================================================
+
+static cv::Mat buildGrayFromYUV(
+    const uint8_t* yData,
+    int imgW, int imgH, int yRowStride,
     int targetW, int targetH, int rotDeg)
 {
-    cv::Mat bgr(targetH, targetW, CV_8UC3);
+    cv::Mat gray(targetH, targetW, CV_8UC1);
 
     for (int ty = 0; ty < targetH; ty++) {
-        auto* row = bgr.ptr<cv::Vec3b>(ty);
+        auto* row = gray.ptr<uint8_t>(ty);
         for (int tx = 0; tx < targetW; tx++) {
             float srcXf, srcYf;
 
@@ -65,23 +99,16 @@ static cv::Mat buildBGRFromYUV(
             int sX = std::max(0, std::min(static_cast<int>(srcXf + 0.5f), imgW - 1));
             int sY = std::max(0, std::min(static_cast<int>(srcYf + 0.5f), imgH - 1));
 
-            int yIdx = sY * yRowStride + sX;
-            int uvIdx = (sY / 2) * uvRowStride + (sX / 2) * uvPixelStride;
-
-            int Y = yData[yIdx];
-            int U = uData[uvIdx] - 128;
-            int V = vData[uvIdx] - 128;
-
-            int r = std::max(0, std::min(255, Y + static_cast<int>(1.370705f * V)));
-            int g = std::max(0, std::min(255, Y - static_cast<int>(0.337633f * U) - static_cast<int>(0.698001f * V)));
-            int b = std::max(0, std::min(255, Y + static_cast<int>(1.732446f * U)));
-
-            row[tx] = cv::Vec3b(static_cast<uint8_t>(b), static_cast<uint8_t>(g), static_cast<uint8_t>(r));
+            row[tx] = yData[sY * yRowStride + sX];
         }
     }
 
-    return bgr;
+    return gray;
 }
+
+// ============================================================================
+// Java <-> C++ conversion helpers
+// ============================================================================
 
 static cv::Mat javaFloatArrayToMat(JNIEnv* env, jfloatArray arr, int rows, int cols) {
     if (arr == nullptr) return cv::Mat();
@@ -112,13 +139,18 @@ static Eigen::Vector3d javaFloatArrayToEigenVector3d(JNIEnv* env, jfloatArray ar
 }
 
 static jfloatArray matToJavaFloatArray(JNIEnv* env, const cv::Mat& mat) {
+    if (mat.empty()) {
+        jfloatArray arr = env->NewFloatArray(0);
+        return arr;
+    }
     int size = mat.rows * mat.cols;
     jfloatArray arr = env->NewFloatArray(size);
-    if (mat.type() == CV_32F) {
+    if (mat.type() == CV_32F && mat.isContinuous()) {
         env->SetFloatArrayRegion(arr, 0, size, (jfloat*)mat.data);
     } else {
         cv::Mat floatMat;
         mat.convertTo(floatMat, CV_32F);
+        if (!floatMat.isContinuous()) floatMat = floatMat.clone();
         env->SetFloatArrayRegion(arr, 0, size, (jfloat*)floatMat.data);
     }
     return arr;
@@ -146,178 +178,121 @@ static jfloatArray eigenVector3dToJavaFloatArray(JNIEnv* env, const Eigen::Vecto
 }
 
 // ============================================================================
-// Middlebury flow visualization (flow_viz colormap)
-// ============================================================================
-
-static int s_colorwheel[55][3];
-static int s_ncols = 0;
-
-static void makeColorWheel() {
-    const int RY=15, YG=6, GC=4, CB=11, BM=13, MR=6;
-    s_ncols = RY+YG+GC+CB+BM+MR;
-    int k=0;
-    for(int i=0;i<RY;i++){s_colorwheel[k][0]=255;s_colorwheel[k][1]=255*i/RY;s_colorwheel[k][2]=0;k++;}
-    for(int i=0;i<YG;i++){s_colorwheel[k][0]=255-255*i/YG;s_colorwheel[k][1]=255;s_colorwheel[k][2]=0;k++;}
-    for(int i=0;i<GC;i++){s_colorwheel[k][0]=0;s_colorwheel[k][1]=255;s_colorwheel[k][2]=255*i/GC;k++;}
-    for(int i=0;i<CB;i++){s_colorwheel[k][0]=0;s_colorwheel[k][1]=255-255*i/CB;s_colorwheel[k][2]=255;k++;}
-    for(int i=0;i<BM;i++){s_colorwheel[k][0]=255*i/BM;s_colorwheel[k][1]=0;s_colorwheel[k][2]=255;k++;}
-    for(int i=0;i<MR;i++){s_colorwheel[k][0]=255;s_colorwheel[k][1]=0;s_colorwheel[k][2]=255-255*i/MR;k++;}
-}
-
-static void computeFlowColor(float fx, float fy, uint8_t& r, uint8_t& g, uint8_t& b) {
-    if (s_ncols == 0) makeColorWheel();
-    float rad = sqrtf(fx*fx + fy*fy);
-    float a = atan2f(-fy, -fx) / (float)M_PI;  // [-1, 1]
-    float fk = (a + 1.0f) / 2.0f * (s_ncols - 1);
-    int k0 = (int)fk;
-    int k1 = (k0 + 1) % s_ncols;
-    float f = fk - k0;
-    float cols[3];
-    for (int c = 0; c < 3; c++) {
-        float col0 = s_colorwheel[k0][c] / 255.0f;
-        float col1 = s_colorwheel[k1][c] / 255.0f;
-        float col = (1-f)*col0 + f*col1;
-        if (rad <= 1.0f) col = 1.0f - rad * (1.0f - col);
-        else             col *= 0.75f;
-        cols[c] = col;
-    }
-    r = (uint8_t)(255.0f * cols[0]);
-    g = (uint8_t)(255.0f * cols[1]);
-    b = (uint8_t)(255.0f * cols[2]);
-}
-
-/**
- * Convert CV_32FC2 flow to packed ARGB int array for Android Bitmap.
- */
-static jintArray flowToARGB(JNIEnv* env, const cv::Mat& flow) {
-    if (flow.empty() || flow.type() != CV_32FC2) return nullptr;
-
-    int H = flow.rows, W = flow.cols;
-
-    // Find max magnitude for normalization
-    float maxRad = 0;
-    for (int y = 0; y < H; y++) {
-        const float* row = flow.ptr<float>(y);
-        for (int x = 0; x < W; x++) {
-            float u = row[x*2], v = row[x*2+1];
-            float rad = sqrtf(u*u + v*v);
-            if (rad > maxRad) maxRad = rad;
-        }
-    }
-    if (maxRad < 1e-5f) maxRad = 1e-5f;
-
-    jintArray arr = env->NewIntArray(H * W);
-    jint* pixels = env->GetIntArrayElements(arr, nullptr);
-
-    for (int y = 0; y < H; y++) {
-        const float* row = flow.ptr<float>(y);
-        for (int x = 0; x < W; x++) {
-            float u = row[x*2] / maxRad;
-            float v = row[x*2+1] / maxRad;
-            uint8_t r, g, b;
-            computeFlowColor(u, v, r, g, b);
-            pixels[y * W + x] = (0xFF << 24) | (r << 16) | (g << 8) | b;  // ARGB
-        }
-    }
-
-    env->ReleaseIntArrayElements(arr, pixels, 0);
-    return arr;
-}
-
-// ============================================================================
-// JNI Functions
+// JNI exports
 // ============================================================================
 
 extern "C" {
 
-/**
- * Create DepthRefinement pipeline.
- * Intrinsics should be in the MODEL space (518x518 rotated).
- */
 JNIEXPORT jlong JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeCreatePipeline(
-    JNIEnv* env, jobject obj,
+Java_com_ptcdepth_android_DepthRefinementManager_nativeCreatePipeline(
+    JNIEnv* env, jobject /*obj*/,
     jfloat fx, jfloat fy, jfloat cx, jfloat cy,
     jint width, jint height,
-    jboolean useGTPose
+    jboolean /*useGTPose*/  // legacy — external pose is now passed per-frame
 ) {
-    LOGI("Creating PR-Depth pipeline: %dx%d, fx=%.1f, fy=%.1f, cx=%.1f, cy=%.1f",
+    LOGI("Creating PTC-Depth pipeline: %dx%d, fx=%.1f, fy=%.1f, cx=%.1f, cy=%.1f",
          width, height, fx, fy, cx, cy);
 
+    LOGI("OpenMP default max_threads = %d", omp_get_max_threads());
+
     try {
-        pr_depth::DepthRefinementConfig config;
+        ptc_depth::PTCDepthConfig config;
         config.fx = fx;
         config.fy = fy;
         config.cx = cx;
         config.cy = cy;
-        config.H = height;
         config.W = width;
+        config.H = height;
+        config.sync();
 
-        config.use_gt_pose_fallback = useGTPose;
-        config.gt_pose_rotation_threshold_deg = 3.0f;
-
-        // Use default config — all params controllable from UI via nativeUpdateFullConfig
-        config.timing = true;
-
-        auto* pipeline = new pr_depth::DepthRefinement(config);
-        LOGI("PR-Depth pipeline created at %p", pipeline);
-        return reinterpret_cast<jlong>(pipeline);
-
+        auto* handle = new PipelineHandle(config);
+        LOGI("PTC-Depth pipeline created at %p", handle);
+        return reinterpret_cast<jlong>(handle);
     } catch (const std::exception& e) {
         LOGE("Failed to create pipeline: %s", e.what());
         return 0;
     }
 }
 
-/**
- * Process a single frame with YUV camera planes.
- *
- * Builds BGR image from YUV using same rotation mapping as QNN preprocessor.
- * Takes QNN inv_depth (at display resolution), resizes to model space (518x518).
- */
-JNIEXPORT jobject JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeProcessFrameYUV(
-    JNIEnv* env, jobject obj,
+// Helper: copy a CV_32F cv::Mat row-by-row into a pre-allocated jfloatArray.
+// Returns true on success. Skips allocation entirely — the destination array
+// is owned by Kotlin (ping-pong buffer).
+static bool writeMatToFloatArray(JNIEnv* env, const cv::Mat& mat, jfloatArray dst,
+                                  int expectedRows, int expectedCols) {
+    const int N = expectedRows * expectedCols;
+    if (env->GetArrayLength(dst) < N) {
+        LOGE("writeMatToFloatArray: destination too small (%d < %d)",
+             env->GetArrayLength(dst), N);
+        return false;
+    }
+    jfloat* ptr = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(dst, nullptr));
+    if (!ptr) return false;
+    if (mat.empty()) {
+        // Pipeline produced no result for this frame — zero the buffer so the
+        // consumer sees a defined state.
+        std::memset(ptr, 0, sizeof(float) * N);
+    } else if (mat.type() == CV_32F && mat.isContinuous() &&
+               mat.rows == expectedRows && mat.cols == expectedCols) {
+        std::memcpy(ptr, mat.data, sizeof(float) * N);
+    } else {
+        // Resize / type-convert defensively if pipeline returned unexpected shape.
+        cv::Mat tmp;
+        cv::Mat src = mat;
+        if (src.type() != CV_32F) src.convertTo(src, CV_32F);
+        if (src.rows != expectedRows || src.cols != expectedCols) {
+            cv::resize(src, tmp, cv::Size(expectedCols, expectedRows));
+            src = tmp;
+        }
+        if (!src.isContinuous()) src = src.clone();
+        std::memcpy(ptr, src.data, sizeof(float) * N);
+    }
+    env->ReleasePrimitiveArrayCritical(dst, ptr, 0);  // 0 = commit changes
+    return true;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_ptcdepth_android_DepthRefinementManager_nativeProcessFrameYUV(
+    JNIEnv* env, jobject /*obj*/,
     jlong pipelinePtr,
-    jbyteArray yArray, jbyteArray uArray, jbyteArray vArray,
+    jbyteArray yArray, jbyteArray /*uArray*/, jbyteArray /*vArray*/,
     jint imgW, jint imgH,
-    jint yRowStride, jint uvRowStride, jint uvPixelStride,
+    jint yRowStride, jint /*uvRowStride*/, jint /*uvPixelStride*/,
     jint rotDeg,
     jfloatArray invDepth, jint depthW, jint depthH,
     jfloat baseline,
-    jfloatArray gtR, jfloatArray gtT
-) {
+    jfloatArray gtR, jfloatArray gtT,
+    jfloatArray refinedOut, jfloatArray triOut,
+    jfloatArray rOut, jfloatArray tOut, jfloatArray scalarOut)
+{
     using Clock = std::chrono::high_resolution_clock;
 
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (!pipeline) {
+    auto* handle = reinterpret_cast<PipelineHandle*>(pipelinePtr);
+    if (!handle) {
         LOGE("Invalid pipeline pointer");
-        return nullptr;
+        return JNI_FALSE;
     }
 
     try {
-        auto config = pipeline->getConfig();
+        auto config = handle->pipeline.config();
         int targetW = config.W;
         int targetH = config.H;
 
         auto t0 = Clock::now();
 
-        // Convert YUV to BGR at model resolution (518x518) with rotation
-        auto* yData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(yArray, nullptr));
-        auto* uData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(uArray, nullptr));
-        auto* vData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(vArray, nullptr));
-
-        cv::Mat img = buildBGRFromYUV(yData, uData, vData,
-            imgW, imgH, yRowStride, uvRowStride, uvPixelStride,
-            targetW, targetH, rotDeg);
-
-        env->ReleasePrimitiveArrayCritical(yArray, yData, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(uArray, uData, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(vArray, vData, JNI_ABORT);
+        // Build grayscale (skip if prepareFlow() already produced a gray + flow)
+        cv::Mat gray;
+        if (!handle->flow_ready) {
+            auto* yData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(yArray, nullptr));
+            gray = buildGrayFromYUV(yData,
+                imgW, imgH, yRowStride,
+                targetW, targetH, rotDeg);
+            env->ReleasePrimitiveArrayCritical(yArray, yData, JNI_ABORT);
+        } else {
+            gray = handle->prev_gray;  // already converted in prepareFlow()
+        }
 
         auto t1 = Clock::now();
 
-        // Get inv_depth and resize from display resolution to model resolution
         cv::Mat inv_depth_display = javaFloatArrayToMat(env, invDepth, depthH, depthW);
         cv::Mat inv_depth;
         if (depthW != targetW || depthH != targetH) {
@@ -329,226 +304,257 @@ Java_com_prdepth_android_DepthRefinementManager_nativeProcessFrameYUV(
 
         auto t2 = Clock::now();
 
-        // Optional GT pose — rotate from original camera frame to rotated image frame
-        std::optional<Eigen::Matrix3d> gt_R_opt;
-        std::optional<Eigen::Vector3d> gt_t_opt;
+        // Optional external pose (rotate from camera frame into rotated-image frame).
+        //
+        // Kotlin passes `gtT` as a UNIT direction vector (ARCoreManager normalizes
+        // it). PTC-Depth's setup_pose() short-circuits motion estimation when both
+        // external_R AND external_t are supplied, using them as-is for the
+        // p_curr = R·p_prev + t pose — so the translation MUST be in metric units
+        // (||t|| = baseline). Scale by baseline here to match the internal
+        // motion-estimation path which calls normalize_t(t_dir, baseline).
+        std::optional<Eigen::Matrix3d> ext_R;
+        std::optional<Eigen::Vector3d> ext_t;
+        bool used_external = false;
+
         if (gtR != nullptr && gtT != nullptr) {
             Eigen::Matrix3d R_orig = javaFloatArrayToEigenMatrix3d(env, gtR);
             Eigen::Vector3d t_orig = javaFloatArrayToEigenVector3d(env, gtT);
 
-            // Build rotation matrix for image rotation (camera 3D coords)
-            // 90° CW:  X_rot = -Y_orig, Y_rot = X_orig, Z_rot = Z_orig
-            // 270° CW: X_rot = Y_orig, Y_rot = -X_orig, Z_rot = Z_orig
-            // 180°:    X_rot = -X_orig, Y_rot = -Y_orig, Z_rot = Z_orig
-            if (rotDeg == 90) {
-                Eigen::Matrix3d C;
-                C << 0, -1, 0,
-                     1,  0, 0,
-                     0,  0, 1;
-                gt_R_opt = C * R_orig * C.transpose();
-                gt_t_opt = C * t_orig;
-            } else if (rotDeg == 270) {
-                Eigen::Matrix3d C;
-                C <<  0, 1, 0,
-                     -1, 0, 0,
-                      0, 0, 1;
-                gt_R_opt = C * R_orig * C.transpose();
-                gt_t_opt = C * t_orig;
-            } else if (rotDeg == 180) {
-                Eigen::Matrix3d C;
-                C << -1,  0, 0,
-                      0, -1, 0,
-                      0,  0, 1;
-                gt_R_opt = C * R_orig * C.transpose();
-                gt_t_opt = C * t_orig;
-            } else {
-                gt_R_opt = R_orig;
-                gt_t_opt = t_orig;
-            }
-        }
+            Eigen::Matrix3d C = Eigen::Matrix3d::Identity();
+            if (rotDeg == 90)        { C <<  0, -1, 0,   1, 0, 0,   0, 0, 1; }
+            else if (rotDeg == 270)  { C <<  0,  1, 0,  -1, 0, 0,   0, 0, 1; }
+            else if (rotDeg == 180)  { C << -1,  0, 0,   0,-1, 0,   0, 0, 1; }
 
-        // Run pipeline
-        auto result = pipeline->refine(img, inv_depth, baseline, gt_R_opt, gt_t_opt);
+            ext_R = C * R_orig * C.transpose();
+            // Re-normalize first (defense against non-unit input) then scale to baseline.
+            Eigen::Vector3d t_rotated = C * t_orig;
+            double tn = t_rotated.norm();
+            if (tn > 1e-8) {
+                ext_t = (t_rotated / tn) * static_cast<double>(baseline);
+            } else {
+                ext_t = Eigen::Vector3d(0.0, 0.0, -static_cast<double>(baseline));
+            }
+            used_external = true;
+        }
+        handle->last_used_external_pose = used_external;
+
+        // Use precomputed flow if available (NPU/CPU pipelined path)
+        cv::Mat flow = handle->flow_ready ? handle->precomputed_flow : cv::Mat();
+
+        ptc_depth::ScaleFusionResult result = handle->pipeline.refine(
+            gray, inv_depth, baseline, ext_R, ext_t, cv::Mat(), flow);
+
+        // Update JNI-side prev frame for the next prepareFlow() call.
+        handle->prev_gray = gray;
+        handle->precomputed_flow.release();
+        handle->flow_ready = false;
 
         auto t3 = Clock::now();
 
-        auto bgrMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        auto grayMs   = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         auto resizeMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
         auto refineMs = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        LOGD("bgr=%lldms resize=%lldms refine=%lldms total=%lldms matches=%d tri=%d",
-             bgrMs, resizeMs, refineMs, bgrMs + resizeMs + refineMs,
-             result.num_matches, result.num_valid_tri);
+        LOGD("gray=%lldms resize=%lldms refine=%lldms total=%lldms",
+             grayMs, resizeMs, refineMs, grayMs + resizeMs + refineMs);
 
-        // Build DepthResult Java object
-        jclass resultClass = env->FindClass("com/prdepth/android/DepthResult");
-        if (!resultClass) { LOGE("DepthResult class not found"); return nullptr; }
+        // Extract R/t from 4x4 pose. PTC-Depth pose convention: p_curr = R p_prev + t
+        Eigen::Matrix3d R = result.pose.block<3,3>(0,0);
+        Eigen::Vector3d t = result.pose.block<3,1>(0,3);
 
-        jmethodID constructor = env->GetMethodID(resultClass, "<init>",
-            "([F[F[F[F[FFIIZF[III)V");
-        if (!constructor) { LOGE("DepthResult constructor not found"); return nullptr; }
+        // Rotation magnitude in degrees (used for status text).
+        Eigen::Vector3d omega = ptc_depth::rotation_matrix_to_omega(R);
+        float rotation_angle_deg = static_cast<float>(omega.norm() * 180.0 / M_PI);
+        if (!std::isfinite(rotation_angle_deg)) rotation_angle_deg = 0.0f;
+        handle->last_rotation_angle_deg = rotation_angle_deg;
 
-        jfloatArray refinedDepth = matToJavaFloatArray(env, result.z_refined);
-        jfloatArray triDepth = matToJavaFloatArray(env, result.z_tri);
-        jfloatArray confidence = matToJavaFloatArray(env, result.confidence);
-        jfloatArray R_arr = eigenMatrix3dToJavaFloatArray(env, result.R);
-        jfloatArray t_arr = eigenVector3dToJavaFloatArray(env, result.t);
+        // Count valid triangulated points (non-NaN, positive z_obs).
+        int num_valid_tri = 0;
+        if (!result.z_obs.empty()) {
+            const float* p = result.z_obs.ptr<float>(0);
+            int N = result.z_obs.rows * result.z_obs.cols;
+            for (int i = 0; i < N; ++i)
+                if (std::isfinite(p[i]) && p[i] > 0.0f) num_valid_tri++;
+        }
+        int num_matches = num_valid_tri;  // PTC-Depth dense triangulation: matches ≈ valid
 
-        // Flow visualization (Middlebury color wheel)
-        jintArray flowPixels = flowToARGB(env, result.flow);
-        int flowW = result.flow.empty() ? 0 : result.flow.cols;
-        int flowH = result.flow.empty() ? 0 : result.flow.rows;
+        // Zero-allocation result write: dump cv::Mat data straight into the
+        // caller-supplied ping-pong FloatArray buffers + scalar buffer. No
+        // env->NewFloatArray() / env->NewObject() in this hot path.
+        if (!writeMatToFloatArray(env, result.z_refined, refinedOut, targetH, targetW)) return JNI_FALSE;
+        if (!writeMatToFloatArray(env, result.z_obs,     triOut,     targetH, targetW)) return JNI_FALSE;
 
-        return env->NewObject(resultClass, constructor,
-            refinedDepth, triDepth, confidence, R_arr, t_arr,
-            result.baseline, result.num_matches, result.num_valid_tri,
-            result.used_gt_pose, result.rotation_angle_deg,
-            flowPixels, flowW, flowH);
+        {
+            jfloat* rPtr = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(rOut, nullptr));
+            if (rPtr) {
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        rPtr[i * 3 + j] = static_cast<float>(R(i, j));
+                env->ReleasePrimitiveArrayCritical(rOut, rPtr, 0);
+            }
+        }
+        {
+            jfloat* tPtr = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(tOut, nullptr));
+            if (tPtr) {
+                tPtr[0] = static_cast<float>(t(0));
+                tPtr[1] = static_cast<float>(t(1));
+                tPtr[2] = static_cast<float>(t(2));
+                env->ReleasePrimitiveArrayCritical(tOut, tPtr, 0);
+            }
+        }
+        {
+            jfloat* sPtr = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(scalarOut, nullptr));
+            if (sPtr) {
+                sPtr[0] = baseline;
+                sPtr[1] = static_cast<float>(num_matches);
+                sPtr[2] = static_cast<float>(num_valid_tri);
+                sPtr[3] = used_external ? 1.0f : 0.0f;
+                sPtr[4] = rotation_angle_deg;
+                env->ReleasePrimitiveArrayCritical(scalarOut, sPtr, 0);
+            }
+        }
+
+        return JNI_TRUE;
 
     } catch (const std::exception& e) {
         LOGE("processFrame failed: %s", e.what());
-        return nullptr;
+        return JNI_FALSE;
     }
 }
 
-/**
- * Update full pipeline configuration at runtime.
- * Accepts key tunable parameters as individual values.
- */
 JNIEXPORT void JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeUpdateFullConfig(
-    JNIEnv* env, jobject obj,
+Java_com_ptcdepth_android_DepthRefinementManager_nativeUpdateFullConfig(
+    JNIEnv* /*env*/, jobject /*obj*/,
     jlong pipelinePtr,
     jint ransacIters,
     jfloat minFlowPx,
     jfloat maxDepth,
     jfloat minBaseline,
-    jfloat fusionLambdaForget,
-    jfloat fusionChi2Soft,
-    jfloat fusionVarFloor,
-    jboolean useSegmentation,
-    jboolean enableIterativeRefinement,
-    jboolean skipFbConsistency,
-    jboolean useGTPose,
-    jboolean timing,
-    jfloat skyMaskInvThresh
-) {
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (!pipeline) return;
+    jfloat lambdaForget,
+    jfloat kappaMin,
+    jfloat tau0Deg,
+    jboolean outdoor,
+    jint iterative,
+    jboolean verbose)
+{
+    auto* handle = reinterpret_cast<PipelineHandle*>(pipelinePtr);
+    if (!handle) return;
 
     try {
-        auto config = pipeline->getConfig();
+        // PTCDepth doesn't expose mutable config_ directly. We rebuild the pipeline
+        // only if structural parameters change — for the tunable knobs we update
+        // the config on the existing instance via reset().
+        auto cfg = handle->pipeline.config();
+        cfg.ransac_max_iters = ransacIters;
+        cfg.min_flow_px      = minFlowPx;
+        cfg.max_depth        = maxDepth;
+        cfg.min_baseline     = minBaseline;
+        cfg.lambda_forget    = lambdaForget;
+        cfg.kappa_min        = kappaMin;
+        cfg.tau0_deg         = tau0Deg;
+        cfg.outdoor          = outdoor;
+        cfg.iterative        = iterative;
+        cfg.verbose          = verbose;
+        cfg.sync();
 
-        config.ransac_max_iters = ransacIters;
-        config.min_flow_px = minFlowPx;
-        config.max_depth = maxDepth;
-        config.min_baseline = minBaseline;
-        config.use_baseline_guard = (minBaseline > 0.0f);
-        config.fusion_lambda_forget = fusionLambdaForget;
-        config.fusion_chi2_soft = fusionChi2Soft;
-        config.fusion_var_floor = fusionVarFloor;
-        config.use_segmentation = useSegmentation;
-        config.enable_iterative_refinement = enableIterativeRefinement;
-        config.skip_fb_consistency = !skipFbConsistency;  // UI: "FB Consistency" ON = skip=false
-        config.use_gt_pose_fallback = useGTPose;
-        config.timing = timing;
-        config.sky_mask_inv_thresh = skyMaskInvThresh;
+        // Recreate the pipeline with the new config (preserves the JNI-side
+        // prev_gray / flow state so NPU/CPU pipelining keeps working).
+        handle->pipeline.~PTCDepth();
+        new (&handle->pipeline) ptc_depth::PTCDepth(cfg);
 
-        pipeline->updateConfig(config);
-
-        LOGI("Full config updated: ransac=%d maxD=%.0f lambda=%.2f chi2=%.1f skyThresh=%.1e",
-             ransacIters, maxDepth, fusionLambdaForget, fusionChi2Soft, skyMaskInvThresh);
+        LOGI("Config updated: ransac=%d maxD=%.1f lambda=%.2f kappa=%.2f outdoor=%d iter=%d",
+             ransacIters, maxDepth, lambdaForget, kappaMin, (int)outdoor, iterative);
 
     } catch (const std::exception& e) {
         LOGE("Failed to update config: %s", e.what());
     }
 }
 
-/**
- * Legacy config update (GT pose only)
- */
 JNIEXPORT void JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeUpdateConfig(
-    JNIEnv* env, jobject obj,
-    jlong pipelinePtr,
-    jboolean useGTPose,
-    jboolean useGTR
-) {
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (!pipeline) return;
-
+Java_com_ptcdepth_android_DepthRefinementManager_nativeReset(
+    JNIEnv* /*env*/, jobject /*obj*/,
+    jlong pipelinePtr)
+{
+    auto* handle = reinterpret_cast<PipelineHandle*>(pipelinePtr);
+    if (!handle) return;
     try {
-        auto config = pipeline->getConfig();
-        config.use_gt_pose_fallback = useGTPose;
-        config.use_gt_R = useGTR;
-        pipeline->updateConfig(config);
+        handle->pipeline.reset();
+        handle->prev_gray.release();
+        handle->precomputed_flow.release();
+        handle->flow_ready = false;
+        LOGI("Pipeline reset");
     } catch (const std::exception& e) {
-        LOGE("Failed to update config: %s", e.what());
+        LOGE("Reset failed: %s", e.what());
     }
 }
 
 JNIEXPORT void JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeReset(
-    JNIEnv* env, jobject obj,
-    jlong pipelinePtr
-) {
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (!pipeline) return;
-    try { pipeline->reset(); LOGI("Pipeline reset"); }
-    catch (const std::exception& e) { LOGE("Reset failed: %s", e.what()); }
-}
-
-JNIEXPORT void JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativeDestroyPipeline(
-    JNIEnv* env, jobject obj,
-    jlong pipelinePtr
-) {
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (pipeline) {
-        delete pipeline;
+Java_com_ptcdepth_android_DepthRefinementManager_nativeDestroyPipeline(
+    JNIEnv* /*env*/, jobject /*obj*/,
+    jlong pipelinePtr)
+{
+    auto* handle = reinterpret_cast<PipelineHandle*>(pipelinePtr);
+    if (handle) {
+        delete handle;
         LOGI("Pipeline destroyed");
     }
 }
 
 /**
- * Phase 1 of pipelined execution: Compute BGR from YUV + optical flow.
- * Call this while QNN inference is running on NPU.
- * The computed flow will be consumed by the next nativeProcessFrameYUV() call.
+ * Phase 1 of pipelined execution: build grayscale + compute optical flow on CPU
+ * while QNN runs depth inference on the NPU. The flow gets fed into the next
+ * processFrameYUV() call so refine() can skip its own flow computation.
  */
 JNIEXPORT void JNICALL
-Java_com_prdepth_android_DepthRefinementManager_nativePrepareFlow(
-    JNIEnv* env, jobject obj,
+Java_com_ptcdepth_android_DepthRefinementManager_nativePrepareFlow(
+    JNIEnv* env, jobject /*obj*/,
     jlong pipelinePtr,
-    jbyteArray yArray, jbyteArray uArray, jbyteArray vArray,
+    jbyteArray yArray, jbyteArray /*uArray*/, jbyteArray /*vArray*/,
     jint imgW, jint imgH,
-    jint yRowStride, jint uvRowStride, jint uvPixelStride,
-    jint rotDeg
-) {
-    auto* pipeline = reinterpret_cast<pr_depth::DepthRefinement*>(pipelinePtr);
-    if (!pipeline) {
+    jint yRowStride, jint /*uvRowStride*/, jint /*uvPixelStride*/,
+    jint rotDeg)
+{
+    auto* handle = reinterpret_cast<PipelineHandle*>(pipelinePtr);
+    if (!handle) {
         LOGE("prepareFlow: Invalid pipeline pointer");
         return;
     }
 
     try {
-        auto config = pipeline->getConfig();
-        int targetW = config.W;
-        int targetH = config.H;
+        using Clock = std::chrono::high_resolution_clock;
+        auto t0 = Clock::now();
 
-        // Convert YUV to BGR at model resolution with rotation
+        auto cfg = handle->pipeline.config();
+        int targetW = cfg.W;
+        int targetH = cfg.H;
+
         auto* yData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(yArray, nullptr));
-        auto* uData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(uArray, nullptr));
-        auto* vData = static_cast<uint8_t*>(env->GetPrimitiveArrayCritical(vArray, nullptr));
-
-        cv::Mat img = buildBGRFromYUV(yData, uData, vData,
-            imgW, imgH, yRowStride, uvRowStride, uvPixelStride,
+        cv::Mat gray_curr = buildGrayFromYUV(yData,
+            imgW, imgH, yRowStride,
             targetW, targetH, rotDeg);
-
         env->ReleasePrimitiveArrayCritical(yArray, yData, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(uArray, uData, JNI_ABORT);
-        env->ReleasePrimitiveArrayCritical(vArray, vData, JNI_ABORT);
 
-        // Compute optical flow (stores internally for next refine() call)
-        pipeline->prepare_flow(img);
+        auto t1 = Clock::now();
+
+        if (handle->prev_gray.empty()) {
+            // First frame: no flow yet, just remember gray.
+            handle->prev_gray = gray_curr;
+            handle->flow_ready = false;
+            return;
+        }
+
+        cv::Mat flow;
+        handle->dis_flow->calc(handle->prev_gray, gray_curr, flow);
+
+        // Stash flow + new gray for the upcoming refine() call.
+        handle->precomputed_flow = flow;
+        handle->prev_gray = gray_curr;
+        handle->flow_ready = true;
+
+        auto t2 = Clock::now();
+        auto grayMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        auto flowMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        LOGD("prepareFlow: gray=%lldms flow=%lldms total=%lldms", grayMs, flowMs, grayMs + flowMs);
+
     } catch (const std::exception& e) {
         LOGE("prepareFlow failed: %s", e.what());
     }

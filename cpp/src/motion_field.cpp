@@ -1,93 +1,61 @@
 /**
- * @file motion_field.cpp
- * @brief Motion field estimation with full RANSAC implementation
+ * Motion field estimation with full RANSAC implementation
  */
-#include "pr_depth/motion_field.hpp"
-#include <unsupported/Eigen/MatrixFunctions>
+#include "ptc_depth/motion_field.hpp"
+#include "ptc_depth/utils.hpp"
 #include <cmath>
 #include <random>
 #include <algorithm>
-#include <unordered_map>
-#include <set>
-#include <iostream>
 #include <sstream>
-#include <omp.h>
 
-namespace pr_depth {
+namespace ptc_depth {
+
+namespace {
+
+// Motion field DOF: omega(3) + t(3)
+constexpr int kMotionDof = 6;
+
+// IRLS convergence: stop when parameter update norm is below this threshold
+constexpr double kIrlsConvergenceTol = 1e-8;
+
+struct ClassifyThresholds { double residual; double angle; };
+
+// ============================================================================
+struct ScoringResult {
+    std::vector<bool> inlier_mask;
+    double score = 0.0;
+    int inlier_count = 0;
+};
+
+// Pre-computed rd shared across RANSAC iterations
+struct RansacData {
+    std::vector<Eigen::Matrix<double, 2, 3>> B_all, A_all;  // Motion Jacobians
+    std::vector<Eigen::Vector2d> obs_px;     // Observed flow (pixel units)
+    std::vector<double> d_rels;              // Inverse depth
+    std::vector<double> flow_mags;           // Flow magnitude (pixel)
+    std::vector<int> cell_ids;               // Spatial grid cell
+    int max_cells = 0;
+    double fx, fy;                           // Focal length (normalized→pixel)
+
+    int size() const { return static_cast<int>(d_rels.size()); }
+};
 
 // ============================================================================
 // RANSAC Utility Functions
 // ============================================================================
 
 /**
- * Compute Huber weights for robust estimation
+ * Count the number of spatial grid cells occupied by at least one inlier.
  */
-std::vector<double> compute_huber_weights(const std::vector<double>& residuals, double delta) {
-    std::vector<double> weights(residuals.size());
-    for (size_t i = 0; i < residuals.size(); ++i) {
-        if (residuals[i] <= delta) {
-            weights[i] = 1.0;
-        } else {
-            weights[i] = delta / (residuals[i] + 1e-12);
-        }
-    }
-    return weights;
-}
-
-/**
- * Compute angle error between predicted and observed flow (in degrees)
- */
-std::vector<double> compute_angle_errors(
-    const std::vector<Eigen::Vector2d>& pred_px,
-    const std::vector<Eigen::Vector2d>& obs_px) {
-
-    std::vector<double> errors(pred_px.size());
-    for (size_t i = 0; i < pred_px.size(); ++i) {
-        double pm = pred_px[i].norm() + 1e-12;
-        double om = obs_px[i].norm() + 1e-12;
-        double dot = pred_px[i].dot(obs_px[i]) / (pm * om);
-        dot = std::max(-1.0, std::min(1.0, dot));
-        errors[i] = std::acos(dot) * 180.0 / M_PI;
-    }
-    return errors;
-}
-
-/**
- * Compute MAD (Median Absolute Deviation) threshold
- */
-double compute_mad_threshold(const std::vector<double>& values, double k = 3.5) {
-    if (values.empty()) return 1e6;
-
-    std::vector<double> sorted = values;
-    std::nth_element(sorted.begin(), sorted.begin() + sorted.size()/2, sorted.end());
-    double median = sorted[sorted.size()/2];
-
-    std::vector<double> abs_dev(values.size());
-    for (size_t i = 0; i < values.size(); ++i) {
-        abs_dev[i] = std::abs(values[i] - median);
-    }
-
-    std::nth_element(abs_dev.begin(), abs_dev.begin() + abs_dev.size()/2, abs_dev.end());
-    double mad = abs_dev[abs_dev.size()/2];
-
-    return median + k * mad + 1e-6;
-}
-
-/**
- * Cell coverage score (number of cells + bonus for spatial distribution)
- */
-double compute_coverage_score(const std::vector<bool>& inlier_mask,
-                              const std::vector<int>& cell_ids,
-                              int max_cells,
-                              double lambda_cell = 1.0) {
-    if (inlier_mask.empty()) return 0.0;
+int count_occupied_cells(const std::vector<bool>& inlier_mask,
+                         const std::vector<int>& cell_ids,
+                         int max_cells) {
+    if (inlier_mask.empty()) return 0;
 
     std::vector<int> counts(max_cells, 0);
-    int total = 0;
     for (size_t i = 0; i < inlier_mask.size(); ++i) {
         if (inlier_mask[i]) {
             counts[cell_ids[i]]++;
-            total++;
         }
     }
 
@@ -96,830 +64,372 @@ double compute_coverage_score(const std::vector<bool>& inlier_mask,
         if (c > 0) occupied_cells++;
     }
 
-    return total + lambda_cell * occupied_cells;
-}
-
-// ============================================================================
-// Translation-only estimation (when rotation is known)
-// ============================================================================
-
-/**
- * Solve for translation only, given known rotation (omega).
- * Motion field: flow = B @ omega + r * A @ t
- * With known omega: flow_trans = flow - B @ omega = r * A @ t
- * This is a 3-DOF linear system for t.
- */
-Eigen::Vector3d solve_translation_only(
-    const std::vector<Eigen::Vector2d>& flow_normalized,
-    const std::vector<Eigen::Vector2d>& coords_normalized,
-    const std::vector<double>& inv_depths,
-    const Eigen::Vector3d& known_omega) {
-
-    int n_points = static_cast<int>(flow_normalized.size());
-    if (n_points < 3) {
-        throw std::runtime_error("Need at least 3 points for translation estimation");
-    }
-
-    // Build linear system: flow_trans = r * A @ t
-    // where flow_trans = flow - B @ omega
-    Eigen::MatrixXd M(2 * n_points, 3);
-    Eigen::VectorXd b(2 * n_points);
-
-    for (int i = 0; i < n_points; ++i) {
-        double x = coords_normalized[i](0);
-        double y = coords_normalized[i](1);
-        double r = inv_depths[i];
-
-        Eigen::Matrix<double, 2, 3> B, A;
-        compute_motion_matrices(x, y, B, A);
-
-        // Subtract rotation component from flow
-        Eigen::Vector2d flow_rot = B * known_omega;
-        Eigen::Vector2d flow_trans = flow_normalized[i] - flow_rot;
-
-        // Equation: flow_trans = r * A @ t
-        M.block<1, 3>(2*i, 0) = A.row(0) * r;
-        M.block<1, 3>(2*i+1, 0) = A.row(1) * r;
-
-        b(2*i) = flow_trans(0);
-        b(2*i+1) = flow_trans(1);
-    }
-
-    // Solve using SVD
-    Eigen::Vector3d t = M.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b);
-    return t;
+    return occupied_cells;
 }
 
 /**
- * RANSAC estimation for translation only (given known rotation).
- * Returns translation vector t (camera frame).
+ * Predict motion field flow and compute relative residuals for all points.
+ * pred_px[i] = (B·ω + d_rel·A·t) in pixels
+ * rel_residuals[i] = ||obs_px[i] - pred_px[i]|| / flow_magnitudes[i]
  */
-Eigen::Vector3d ransac_estimate_translation_only(
-    const std::vector<Eigen::Vector2d>& flow_normalized,
-    const std::vector<Eigen::Vector2d>& coords_normalized,
-    const std::vector<double>& inv_depths,
-    const std::vector<double>& flow_magnitudes,
-    const std::vector<int>& cell_ids,
-    const CameraIntrinsics& intrinsics,
-    int max_cells,
-    const Eigen::Vector3d& known_omega,
+void eval_hypothesis(
+    const RansacData& rd,
+    const Eigen::Vector3d& omega,
+    const Eigen::Vector3d& t_dir,
+    std::vector<Eigen::Vector2d>& pred_px,
+    std::vector<double>& rel_residuals) {
+
+    int n = rd.size();
+    pred_px.resize(n);
+    rel_residuals.resize(n);
+    for (int i = 0; i < n; ++i) {
+        double d = rd.d_rels[i];
+        Eigen::Vector2d pred;
+        pred(0) = rd.B_all[i].row(0).dot(omega) + rd.A_all[i].row(0).dot(t_dir) * d;
+        pred(1) = rd.B_all[i].row(1).dot(omega) + rd.A_all[i].row(1).dot(t_dir) * d;
+        pred_px[i] = Eigen::Vector2d(pred(0) * rd.fx, pred(1) * rd.fy);
+        rel_residuals[i] = (rd.obs_px[i] - pred_px[i]).norm() / rd.flow_mags[i];
+    }
+}
+
+// Fill linear system rows: predicted_flow = B·ω + d_rel·A·t
+void fill_system_row(
+    const Eigen::Matrix<double, 2, 3>& B,
+    const Eigen::Matrix<double, 2, 3>& A,
+    double d_rel, double w,
+    const Eigen::Vector2d& rhs,
+    bool translation_only,
+    Eigen::MatrixXd& M, Eigen::VectorXd& b, int row) {
+
+    if (translation_only) {
+        M.block<1, 3>(row,   0) = A.row(0) * d_rel * w;
+        M.block<1, 3>(row+1, 0) = A.row(1) * d_rel * w;
+    } else {
+        M.block<1, 3>(row,   0) = B.row(0) * w;
+        M.block<1, 3>(row+1, 0) = B.row(1) * w;
+        M.block<1, 3>(row,   3) = A.row(0) * d_rel * w;
+        M.block<1, 3>(row+1, 3) = A.row(1) * d_rel * w;
+    }
+    b(row)   = rhs(0) * w;
+    b(row+1) = rhs(1) * w;
+}
+
+/**
+ * Compute adaptive MAD-based thresholds for residual and angle error.
+ */
+static ClassifyThresholds mad_thresholds(
+    const std::vector<double>& sample_residuals,
+    const std::vector<double>& sample_angle_errors,
     const MotionFieldConfig& cfg) {
 
-    // Validate known_omega
-    if (!known_omega.allFinite()) {
-        return Eigen::Vector3d(0, 0, -1);  // Return default forward direction
+    ClassifyThresholds thr;
+    thr.residual = compute_mad_threshold(sample_residuals, cfg.classify_mad_scale);
+
+    constexpr double kAngleThreshDefault = 45.0;
+    constexpr double kAngleThreshMax = 60.0;
+    constexpr int kAngleMinSamples = 10;
+
+    thr.angle = kAngleThreshDefault;
+    if (static_cast<int>(sample_angle_errors.size()) > kAngleMinSamples) {
+        thr.angle = compute_mad_threshold(sample_angle_errors, cfg.classify_angle_mad_scale);
+        thr.angle = std::max(static_cast<double>(cfg.classify_angle_min),
+                             std::min(thr.angle, kAngleThreshMax));
     }
+    return thr;
+}
+
+/**
+ * Pre-compute motion Jacobians B and A for all points.
+ * B (2x3): rotation term; A (2x3): translation term.
+ */
+static void motion_jacobians(
+    const std::vector<Eigen::Vector2d>& coords,
+    std::vector<Eigen::Matrix<double, 2, 3>>& B_all,
+    std::vector<Eigen::Matrix<double, 2, 3>>& A_all) {
+
+    int n = static_cast<int>(coords.size());
+    B_all.resize(n);
+    A_all.resize(n);
+    for (int i = 0; i < n; ++i) {
+        compute_motion_matrices(coords[i](0), coords[i](1), B_all[i], A_all[i]);
+    }
+}
+
+}  // namespace
+
+namespace motion {
+
+// MAD-based scoring with optional direction check
+ScoringResult score_hypothesis(
+    const std::vector<double>& rel_residuals,
+    const std::vector<Eigen::Vector2d>& pred_px,
+    const std::vector<Eigen::Vector2d>& obs_px,
+    const std::vector<int>* cell_ids,  // nullptr = skip coverage bonus
+    int max_cells,
+    const MotionFieldConfig& cfg) {
+
+    int n = static_cast<int>(rel_residuals.size());
+    ScoringResult result;
+    result.inlier_mask.resize(n, false);
+    result.score = 0.0;
+    result.inlier_count = 0;
+
+    double thresh = compute_mad_threshold(rel_residuals, cfg.ransac_mad_scale);
+    thresh = std::max(static_cast<double>(cfg.ransac_mad_min),
+                      std::min(thresh, static_cast<double>(cfg.ransac_mad_max)));
+
+    for (int i = 0; i < n; ++i) {
+        bool is_inlier = (rel_residuals[i] <= thresh);
+
+        // Direction check
+        if (is_inlier) {
+            double pred_mag = pred_px[i].norm() + kEpsDenom;
+            double obs_mag = obs_px[i].norm() + kEpsDenom;
+            double cos_sim = pred_px[i].dot(obs_px[i]) / (pred_mag * obs_mag);
+            if (cos_sim < cfg.cos_sim_thresh) {
+                is_inlier = false;
+            }
+        }
+
+        result.inlier_mask[i] = is_inlier;
+        if (is_inlier) {
+            result.inlier_count++;
+            result.score += 1.0;
+        }
+    }
+
+    // Cell coverage bonus
+    if (cell_ids) {
+        result.score += count_occupied_cells(result.inlier_mask, *cell_ids, max_cells);
+    }
+
+    return result;
+}
+
+// IRLS refinement
+Eigen::VectorXd refine_irls(
+    const std::vector<Eigen::Vector2d>& flow_normalized,
+    const RansacData& rd,
+    const Eigen::VectorXd& theta_init,
+    const MotionFieldConfig& cfg,
+    const std::optional<Eigen::Vector3d>& known_omega) {
 
     int n_points = static_cast<int>(flow_normalized.size());
-    if (n_points < 3) {
-        return Eigen::Vector3d(0, 0, -1);  // Not enough points, return default
-    }
+    bool translation_only = known_omega.has_value();
+    int dof = translation_only ? 3 : kMotionDof;
 
-    // Safety check: all vectors should have same size
-    if (static_cast<int>(coords_normalized.size()) != n_points ||
-        static_cast<int>(inv_depths.size()) != n_points ||
-        static_cast<int>(flow_magnitudes.size()) != n_points ||
-        static_cast<int>(cell_ids.size()) != n_points) {
-        return Eigen::Vector3d(0, 0, -1);  // Size mismatch, return default
-    }
+    const auto& B_all = rd.B_all;
+    const auto& A_all = rd.A_all;
+    const auto& d_rels = rd.d_rels;
 
-    double fx = intrinsics.fx;
-    double fy = intrinsics.fy;
-
-    // Pre-compute B, A matrices and flow_trans (with rotation subtracted)
-    std::vector<Eigen::Matrix<double, 2, 3>> B_all(n_points);
-    std::vector<Eigen::Matrix<double, 2, 3>> A_all(n_points);
-    std::vector<Eigen::Vector2d> flow_trans_all(n_points);
-
-    for (int i = 0; i < n_points; ++i) {
-        double x = coords_normalized[i](0);
-        double y = coords_normalized[i](1);
-        compute_motion_matrices(x, y, B_all[i], A_all[i]);
-        flow_trans_all[i] = flow_normalized[i] - B_all[i] * known_omega;
-    }
-
-    // Build cell-to-indices map
-    std::unordered_map<int, std::vector<int>> cell_to_idx;
-    for (int i = 0; i < n_points; ++i) {
-        cell_to_idx[cell_ids[i]].push_back(i);
-    }
-
-    std::vector<int> unique_cells;
-    for (const auto& pair : cell_to_idx) {
-        unique_cells.push_back(pair.first);
-    }
-
-    if (unique_cells.empty()) {
-        throw std::runtime_error("No valid cells for translation RANSAC");
-    }
-
-    // RANSAC loop
-    Eigen::Vector3d best_t = Eigen::Vector3d(0, 0, -1);  // Default: forward direction
-    double best_score = -1.0;
-
-    std::mt19937 gen(cfg.seed == 0 ? std::random_device{}() : cfg.seed);
-
-    // Use fewer iterations for translation-only (3 DOF vs 6 DOF)
-    int max_iters = std::min(cfg.ransac_max_iters, 100);
-
-    for (int iter = 0; iter < max_iters; ++iter) {
-        // Sample 3 cells (minimum for translation)
-        int s_eff = std::min(3, static_cast<int>(unique_cells.size()));
-        if (s_eff < 3) {
-            // Not enough cells - use all points from available cells
-            s_eff = static_cast<int>(unique_cells.size());
-        }
-
-        std::vector<int> sampled_cells;
-        std::sample(unique_cells.begin(), unique_cells.end(),
-                   std::back_inserter(sampled_cells), s_eff, gen);
-
-        // Pick one point from each cell
-        std::vector<int> sample_indices;
-        for (int cell : sampled_cells) {
-            auto it = cell_to_idx.find(cell);
-            if (it == cell_to_idx.end() || it->second.empty()) continue;
-            const auto& indices = it->second;
-            std::uniform_int_distribution<> dis(0, static_cast<int>(indices.size()) - 1);
-            sample_indices.push_back(indices[dis(gen)]);
-        }
-
-        if (sample_indices.size() < 3) continue;
-
-        // Build sample data
-        std::vector<Eigen::Vector2d> flow_sample, coords_sample;
-        std::vector<double> inv_depths_sample;
-        for (int idx : sample_indices) {
-            if (idx < 0 || idx >= n_points) continue;
-            flow_sample.push_back(flow_normalized[idx]);
-            coords_sample.push_back(coords_normalized[idx]);
-            inv_depths_sample.push_back(inv_depths[idx]);
-        }
-
-        if (flow_sample.size() < 3) continue;
-
-        // Solve for translation
-        Eigen::Vector3d t_s;
-        try {
-            t_s = solve_translation_only(flow_sample, coords_sample, inv_depths_sample, known_omega);
-        } catch (...) {
-            continue;
-        }
-
-        // Check for valid result
-        if (!t_s.allFinite()) continue;
-
-        // Score: compute inliers using MAGSAC++ or MAD-based scoring
-        double score_s = 0.0;
-
-        for (int i = 0; i < n_points; ++i) {
-            double r = inv_depths[i];
-            const auto& A = A_all[i];
-
-            // Predicted translation flow
-            Eigen::Vector2d pred_trans = A * t_s * r;
-            Eigen::Vector2d err = flow_trans_all[i] - pred_trans;
-
-            double ex = err(0) * fx, ey = err(1) * fy;
-            double res_px = std::sqrt(ex * ex + ey * ey);
-            double flow_mag = flow_magnitudes[i];
-            if (flow_mag < 1e-6) flow_mag = 1e-6;  // Avoid division by zero
-            double rel_res = res_px / flow_mag;
-
-            if (cfg.use_magsac_scoring) {
-                double weight = std::max(0.0, 1.0 - rel_res / cfg.magsac_rel_sigma_max);
-                score_s += weight;
-            } else {
-                if (rel_res < cfg.ransac_thresh_ratio * 0.2) {
-                    score_s += 1.0;
-                }
-            }
-        }
-
-        if (score_s > best_score) {
-            best_t = t_s;
-            best_score = score_s;
-        }
-    }
-
-    if (best_score < 0 || !best_t.allFinite()) {
-        // Return default forward direction if RANSAC failed
-        return Eigen::Vector3d(0, 0, -1);
-    }
-
-    return best_t;
-}
-
-// ============================================================================
-// MotionFieldEstimator Implementation
-// ============================================================================
-
-MotionFieldEstimator::MotionFieldEstimator(const MotionFieldConfig& cfg)
-    : cfg_(cfg) {}
-
-Eigen::VectorXd MotionFieldEstimator::solve_least_squares(
-    const std::vector<Eigen::Vector2d>& flow_normalized,
-    const std::vector<Eigen::Vector2d>& coords_normalized,
-    const std::vector<double>& inv_depths) {
-
-    int n_points = flow_normalized.size();
-
-    // Determine number of variables based on depth_scale_mode
-    // mode 0: 6 vars (omega[3], t[3])
-    // mode 1: 7 vars - same as mode 0 (s*t, normalize later)
-    // mode 2: 7 vars CONSTRAINED (omega[3], t[3], alpha[1])
-    //         flow = B @ omega + (r + alpha) * A @ t
-    //         This constrains t_offset = alpha * t (same direction as t)
-
-    int n_vars = 6;  // default: omega(3) + t(3)
-    if (cfg_.depth_scale_mode == 2) {
-        n_vars = 7;  // omega(3) + t(3) + alpha(1) - CONSTRAINED
-    }
-
-    if (n_points < (n_vars + 1) / 2) {
-        throw std::runtime_error("Need more points for motion field estimation");
-    }
-
-    if (cfg_.depth_scale_mode == 2) {
-        // Constrained Mode 2: flow = B @ omega + (r + alpha) * A @ t
-        // This is nonlinear in (t, alpha), so we use alternating optimization:
-        // 1. Initialize with mode 0 solution (alpha = 0)
-        // 2. Fix t direction, solve for omega, |t|, alpha
-        // 3. Iterate if needed
-
-        // Step 1: Solve mode 0 to get initial t direction
-        Eigen::MatrixXd M0(2 * n_points, 6);
-        Eigen::VectorXd b0(2 * n_points);
-
-        for (int i = 0; i < n_points; ++i) {
-            double x = coords_normalized[i](0);
-            double y = coords_normalized[i](1);
-            double r = inv_depths[i];
-
-            Eigen::Matrix<double, 2, 3> B, A;
-            compute_motion_matrices(x, y, B, A);
-
-            M0.block<1, 3>(2*i, 0) = B.row(0);
-            M0.block<1, 3>(2*i+1, 0) = B.row(1);
-            M0.block<1, 3>(2*i, 3) = A.row(0) * r;
-            M0.block<1, 3>(2*i+1, 3) = A.row(1) * r;
-
-            b0(2*i) = flow_normalized[i](0);
-            b0(2*i+1) = flow_normalized[i](1);
-        }
-
-        Eigen::VectorXd theta0 = M0.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b0);
-        Eigen::Vector3d omega_init = theta0.head<3>();
-        Eigen::Vector3d t_init = theta0.tail<3>();
-        double t_norm = t_init.norm();
-        if (t_norm < 1e-10) {
-            // Degenerate case: return mode 0 result with alpha=0
-            Eigen::VectorXd theta(7);
-            theta.head<6>() = theta0;
-            theta(6) = 0.0;
-            return theta;
-        }
-        Eigen::Vector3d t_dir = t_init / t_norm;
-
-        // Step 2: Fix t direction, solve linear system for [omega(3), scale(1), alpha(1)]
-        // flow = B @ omega + (r + alpha) * scale * A @ t_dir
-        //      = B @ omega + r * scale * A @ t_dir + alpha * scale * A @ t_dir
-        // Let s = scale, a = alpha * scale
-        // flow = B @ omega + r * s * (A @ t_dir) + a * (A @ t_dir)
-        // This is linear in [omega, s, a] (5 variables)
-
-        Eigen::MatrixXd M2(2 * n_points, 5);
-        Eigen::VectorXd b2(2 * n_points);
-
-        for (int i = 0; i < n_points; ++i) {
-            double x = coords_normalized[i](0);
-            double y = coords_normalized[i](1);
-            double r = inv_depths[i];
-
-            Eigen::Matrix<double, 2, 3> B, A;
-            compute_motion_matrices(x, y, B, A);
-
-            // A @ t_dir (2x1)
-            Eigen::Vector2d At = A * t_dir;
-
-            M2.block<1, 3>(2*i, 0) = B.row(0);
-            M2.block<1, 3>(2*i+1, 0) = B.row(1);
-            M2(2*i, 3) = At(0) * r;      // r * s * (A @ t_dir)
-            M2(2*i+1, 3) = At(1) * r;
-            M2(2*i, 4) = At(0);          // a * (A @ t_dir) where a = alpha * s
-            M2(2*i+1, 4) = At(1);
-
-            b2(2*i) = flow_normalized[i](0);
-            b2(2*i+1) = flow_normalized[i](1);
-        }
-
-        Eigen::VectorXd theta2 = M2.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b2);
-
-        // Extract: omega(3), s(1), a(1) where a = alpha * s
-        Eigen::Vector3d omega = theta2.head<3>();
-        double s = theta2(3);  // scale
-        double a = theta2(4);  // alpha * scale
-
-        // Recover t = s * t_dir, alpha = a / s
-        Eigen::Vector3d t = s * t_dir;
-        double alpha = (std::abs(s) > 1e-10) ? (a / s) : 0.0;
-
-        // Return theta = [omega(3), t(3), alpha(1)]
-        Eigen::VectorXd theta(7);
-        theta.head<3>() = omega;
-        theta.segment<3>(3) = t;
-        theta(6) = alpha;
-        return theta;
-
-    } else {
-        // Standard mode (mode 0/1): flow = B @ omega + r * A @ t
-        Eigen::MatrixXd M(2 * n_points, n_vars);
-        Eigen::VectorXd b(2 * n_points);
-
-        for (int i = 0; i < n_points; ++i) {
-            double x = coords_normalized[i](0);
-            double y = coords_normalized[i](1);
-            double r = inv_depths[i];
-
-            Eigen::Matrix<double, 2, 3> B, A;
-            compute_motion_matrices(x, y, B, A);
-
-            M.block<1, 3>(2*i, 0) = B.row(0);
-            M.block<1, 3>(2*i+1, 0) = B.row(1);
-            M.block<1, 3>(2*i, 3) = A.row(0) * r;
-            M.block<1, 3>(2*i+1, 3) = A.row(1) * r;
-
-            b(2*i) = flow_normalized[i](0);
-            b(2*i+1) = flow_normalized[i](1);
-        }
-
-        // Solve using SVD
-        Eigen::VectorXd theta = M.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b);
-        return theta;
-    }
-}
-
-Eigen::VectorXd MotionFieldEstimator::refine_irls(
-    const std::vector<Eigen::Vector2d>& flow_normalized,
-    const std::vector<Eigen::Vector2d>& coords_normalized,
-    const std::vector<double>& inv_depths,
-    const Eigen::VectorXd& theta_init,
-    const CameraIntrinsics& intrinsics) {
-
-    int n_points = flow_normalized.size();
     Eigen::VectorXd theta = theta_init;
+    double delta = cfg.huber_delta_rel;
 
-    double fx = intrinsics.fx;
-    double fy = intrinsics.fy;
-    double delta = cfg_.huber_delta_rel;
+    std::vector<Eigen::Vector2d> pred_px(n_points);
+    std::vector<double> rel_residuals(n_points);
+    std::vector<double> weights(n_points);
+    Eigen::MatrixXd M_weighted(2 * n_points, dof);
+    Eigen::VectorXd b_weighted(2 * n_points);
 
-    // OPTIMIZATION: Pre-compute B, A matrices once for all points
-    std::vector<Eigen::Matrix<double, 2, 3>> B_irls(n_points);
-    std::vector<Eigen::Matrix<double, 2, 3>> A_irls(n_points);
-    for (int i = 0; i < n_points; ++i) {
-        double x = coords_normalized[i](0);
-        double y = coords_normalized[i](1);
-        compute_motion_matrices(x, y, B_irls[i], A_irls[i]);
-    }
-
-    // Determine number of variables based on depth_scale_mode
-    int n_vars = 6;
-    if (cfg_.depth_scale_mode == 2) {
-        n_vars = 7;  // CONSTRAINED: omega(3) + t(3) + alpha(1)
-    }
-
-    for (int iter = 0; iter < cfg_.lo_irls_iters; ++iter) {
-        // Compute residuals and weights
-        std::vector<double> weights(n_points);
+    for (int iter = 0; iter < cfg.lo_irls_iters; ++iter) {
         Eigen::Vector3d omega = theta.head<3>();
-        Eigen::Vector3d t;
-        double alpha = 0.0;
+        Eigen::Vector3d t_dir = theta.tail<3>();
 
-        if (cfg_.depth_scale_mode == 2) {
-            // Constrained mode: theta = [omega(3), t(3), alpha(1)]
-            t = theta.segment<3>(3);
-            alpha = theta(6);
-        } else {
-            t = theta.tail<3>();
-        }
+        eval_hypothesis(rd, omega, t_dir, pred_px, rel_residuals);
+
+        for (int i = 0; i < n_points; ++i)
+            weights[i] = (rel_residuals[i] <= delta) ? 1.0 : (delta / (rel_residuals[i] + kEpsDenom));
 
         for (int i = 0; i < n_points; ++i) {
-            double r = inv_depths[i];
-            const auto& B = B_irls[i];
-            const auto& A = A_irls[i];
-
-            // Predicted flow (normalized)
-            // Constrained mode: flow = B @ omega + (r + alpha) * A @ t
-            Eigen::Vector2d pred_n;
-            double r_eff = (cfg_.depth_scale_mode == 2) ? (r + alpha) : r;
-            pred_n(0) = B.row(0).dot(omega) + A.row(0).dot(t) * r_eff;
-            pred_n(1) = B.row(1).dot(omega) + A.row(1).dot(t) * r_eff;
-
-            // Residual in pixels
-            Eigen::Vector2d err = flow_normalized[i] - pred_n;
-            double ex = err(0) * fx, ey = err(1) * fy;
-            double res_px = std::sqrt(ex * ex + ey * ey);
-
-            // Flow magnitude for relative normalization
-            double fmx = flow_normalized[i](0) * fx, fmy = flow_normalized[i](1) * fy;
-            double flow_mag = std::sqrt(fmx * fmx + fmy * fmy);
-            double scale = std::max(flow_mag, static_cast<double>(cfg_.min_flow_px));
-
-            // Relative residual
-            double r_rel = res_px / scale;
-
-            // Huber weight
-            weights[i] = (r_rel <= delta) ? 1.0 : (delta / (r_rel + 1e-12));
+            double d_rel = d_rels[i];
+            double w = std::sqrt(weights[i]);
+            Eigen::Vector2d rhs = translation_only
+                ? flow_normalized[i] - B_all[i] * omega
+                : flow_normalized[i];
+            fill_system_row(B_all[i], A_all[i], d_rel, w, rhs, translation_only,
+                            M_weighted, b_weighted, 2*i);
         }
 
-        // Weighted least squares with constrained formulation
-        if (cfg_.depth_scale_mode == 2) {
-            // Constrained mode: flow = B @ omega + (r + alpha) * A @ t
-            // Use alternating optimization: fix t direction, solve for [omega, scale, alpha*scale]
+        Eigen::VectorXd partial = M_weighted.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b_weighted);
 
-            // Get current t direction
-            double t_norm = t.norm();
-            if (t_norm < 1e-10) {
-                // Degenerate: keep current theta
-                break;
-            }
-            Eigen::Vector3d t_dir = t / t_norm;
+        Eigen::VectorXd theta_new(kMotionDof);
+        if (translation_only)
+            theta_new << omega, partial;
+        else
+            theta_new = partial;
 
-            // Build weighted system for [omega(3), s(1), a(1)] where t = s*t_dir, t_offset = a*t_dir
-            Eigen::MatrixXd M_weighted(2 * n_points, 5);
-            Eigen::VectorXd b_weighted(2 * n_points);
-
-            for (int i = 0; i < n_points; ++i) {
-                double r = inv_depths[i];
-                double w = std::sqrt(weights[i]);
-                const auto& B = B_irls[i];
-                const auto& A = A_irls[i];
-
-                Eigen::Vector2d At = A * t_dir;
-
-                M_weighted.block<1, 3>(2*i, 0) = B.row(0) * w;
-                M_weighted.block<1, 3>(2*i+1, 0) = B.row(1) * w;
-                M_weighted(2*i, 3) = At(0) * r * w;      // r * s * (A @ t_dir)
-                M_weighted(2*i+1, 3) = At(1) * r * w;
-                M_weighted(2*i, 4) = At(0) * w;          // a * (A @ t_dir)
-                M_weighted(2*i+1, 4) = At(1) * w;
-
-                b_weighted(2*i) = flow_normalized[i](0) * w;
-                b_weighted(2*i+1) = flow_normalized[i](1) * w;
-            }
-
-            Eigen::VectorXd theta5 = M_weighted.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b_weighted);
-
-            // Extract and convert back to 7-var theta
-            Eigen::Vector3d omega_new = theta5.head<3>();
-            double s_new = theta5(3);
-            double a_new = theta5(4);
-
-            Eigen::Vector3d t_new = s_new * t_dir;
-            double alpha_new = (std::abs(s_new) > 1e-10) ? (a_new / s_new) : 0.0;
-
-            Eigen::VectorXd theta_new(7);
-            theta_new.head<3>() = omega_new;
-            theta_new.segment<3>(3) = t_new;
-            theta_new(6) = alpha_new;
-
-            // Check convergence
-            if ((theta_new - theta).norm() <= 1e-8 * (theta.norm() + 1e-12)) {
-                theta = theta_new;
-                break;
-            }
-
+        if ((theta_new - theta).norm() <= kIrlsConvergenceTol * (theta.norm() + kEpsDenom)) {
             theta = theta_new;
-
-        } else {
-            // Standard mode (mode 0/1)
-            Eigen::MatrixXd M_weighted(2 * n_points, n_vars);
-            Eigen::VectorXd b_weighted(2 * n_points);
-
-            for (int i = 0; i < n_points; ++i) {
-                double r = inv_depths[i];
-                double w = std::sqrt(weights[i]);
-                const auto& B = B_irls[i];
-                const auto& A = A_irls[i];
-
-                M_weighted.block<1, 3>(2*i, 0) = B.row(0) * w;
-                M_weighted.block<1, 3>(2*i+1, 0) = B.row(1) * w;
-                M_weighted.block<1, 3>(2*i, 3) = A.row(0) * r * w;
-                M_weighted.block<1, 3>(2*i+1, 3) = A.row(1) * r * w;
-
-                b_weighted(2*i) = flow_normalized[i](0) * w;
-                b_weighted(2*i+1) = flow_normalized[i](1) * w;
-            }
-
-            Eigen::VectorXd theta_new = M_weighted.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b_weighted);
-
-            // Check convergence
-            if ((theta_new - theta).norm() <= 1e-8 * (theta.norm() + 1e-12)) {
-                theta = theta_new;
-                break;
-            }
-
-            theta = theta_new;
+            break;
         }
+        theta = theta_new;
     }
 
     return theta;
 }
 
-/**
- * Full RANSAC estimation with cell-based sampling and adaptive thresholds
- * OPTIMIZED: Pre-compute B, A matrices, reuse memory
- */
-Eigen::VectorXd MotionFieldEstimator::ransac_estimate(
+// ============================================================================
+// RANSAC estimation of motion field parameters
+//
+// When known_omega is provided (translation-only mode), omega is fixed and only
+// the translational velocity t is estimated (3-DOF). Otherwise, both omega and t
+// are estimated jointly (6-DOF). The return value is always a 6D vector [omega; t].
+// ============================================================================
+Eigen::VectorXd ransac(
     const std::vector<Eigen::Vector2d>& flow_normalized,
     const std::vector<Eigen::Vector2d>& coords_normalized,
-    const std::vector<double>& inv_depths,
-    const std::vector<double>& flow_magnitudes,
-    const std::vector<int>& cell_ids,
-    const CameraIntrinsics& intrinsics,
-    int max_cells) {
+    const std::vector<double>& d_rels_in,
+    const std::vector<double>& flow_magnitudes_in,
+    const std::vector<int>& cell_ids_in,
+    int max_cells,
+    const MotionFieldConfig& cfg,
+    double fx, double fy,
+    const std::optional<Eigen::Vector3d>& known_omega) {
 
-    int n_points = flow_normalized.size();
-    if (n_points < cfg_.ransac_min_sample) {
+    bool translation_only = known_omega.has_value();
+    int dof = translation_only ? 3 : kMotionDof;
+
+    int n_points = static_cast<int>(flow_normalized.size());
+    if (n_points < cfg.ransac_min_sample) {
         throw std::runtime_error("Not enough points for RANSAC");
     }
 
-    double fx = intrinsics.fx;
-    double fy = intrinsics.fy;
+    // Build shared RANSAC rd (pre-computed once)
+    RansacData rd;
+    motion_jacobians(coords_normalized, rd.B_all, rd.A_all);
+    rd.d_rels = d_rels_in;
+    rd.flow_mags = flow_magnitudes_in;
+    rd.cell_ids = cell_ids_in;
+    rd.max_cells = max_cells;
+    rd.fx = fx;
+    rd.fy = fy;
+    rd.obs_px.resize(n_points);
+    for (int i = 0; i < n_points; ++i)
+        rd.obs_px[i] = Eigen::Vector2d(flow_normalized[i](0) * fx, flow_normalized[i](1) * fy);
 
-    // Determine number of variables based on depth_scale_mode
-    int n_vars = 6;
-    if (cfg_.depth_scale_mode == 2) {
-        n_vars = 7;  // CONSTRAINED: omega(3) + t(3) + alpha(1)
+    // Aliases for readability
+    const auto& B_all = rd.B_all;
+    const auto& A_all = rd.A_all;
+    const auto& d_rels = rd.d_rels;
+
+    // flow_eff: flow with rotation removed (translation-only mode)
+    // When not translation-only, alias the original to avoid copying
+    std::vector<Eigen::Vector2d> flow_eff_storage;
+    if (translation_only) {
+        flow_eff_storage.resize(n_points);
+        for (int i = 0; i < n_points; ++i)
+            flow_eff_storage[i] = flow_normalized[i] - B_all[i] * known_omega.value();
     }
+    const auto& flow_eff = translation_only ? flow_eff_storage : flow_normalized;
 
-    // ===== OPTIMIZATION: Pre-compute B, A matrices for all points =====
-    // These are constant throughout RANSAC, so compute once
-    std::vector<Eigen::Matrix<double, 2, 3>> B_all(n_points);
-    std::vector<Eigen::Matrix<double, 2, 3>> A_all(n_points);
-
+    // Build cell-to-indices map (dense vector instead of unordered_map)
+    int n_cells = rd.max_cells > 0 ? rd.max_cells : (*std::max_element(rd.cell_ids.begin(), rd.cell_ids.end()) + 1);
+    std::vector<std::vector<int>> cell_to_idx(n_cells);
     for (int i = 0; i < n_points; ++i) {
-        double x = coords_normalized[i](0);
-        double y = coords_normalized[i](1);
-        compute_motion_matrices(x, y, B_all[i], A_all[i]);
-    }
-
-    // Build cell-to-indices map
-    std::unordered_map<int, std::vector<int>> cell_to_idx;
-    for (int i = 0; i < n_points; ++i) {
-        cell_to_idx[cell_ids[i]].push_back(i);
+        cell_to_idx[rd.cell_ids[i]].push_back(i);
     }
 
     std::vector<int> unique_cells;
-    unique_cells.reserve(cell_to_idx.size());
-    for (const auto& pair : cell_to_idx) {
-        unique_cells.push_back(pair.first);
+    unique_cells.reserve(n_cells);
+    for (int c = 0; c < n_cells; ++c) {
+        if (!cell_to_idx[c].empty()) {
+            unique_cells.push_back(c);
+        }
     }
 
     if (unique_cells.empty()) {
         throw std::runtime_error("No valid cells for RANSAC");
     }
 
-    // Initialize threshold with robust estimate
-    double thr_eval = cfg_.ransac_thresh_ratio;
-
-    // Seed threshold using initial subset
-    {
-        int seed_take = std::min(256, n_points);
-        std::vector<Eigen::Vector2d> flow_seed(flow_normalized.begin(), flow_normalized.begin() + seed_take);
-        std::vector<Eigen::Vector2d> coords_seed(coords_normalized.begin(), coords_normalized.begin() + seed_take);
-        std::vector<double> inv_depths_seed(inv_depths.begin(), inv_depths.begin() + seed_take);
-
-        try {
-            Eigen::VectorXd theta_seed = solve_least_squares(flow_seed, coords_seed, inv_depths_seed);
-
-            // Compute residuals on full set
-            std::vector<double> res_ratios;
-            Eigen::Vector3d omega_seed = theta_seed.head<3>();
-            Eigen::Vector3d t_seed = theta_seed.tail<3>();
-            for (int i = 0; i < n_points; ++i) {
-                double r = inv_depths[i];
-                const auto& B = B_all[i];
-                const auto& A = A_all[i];
-
-                Eigen::Vector2d pred_n;
-                pred_n(0) = B.row(0).dot(omega_seed) + A.row(0).dot(t_seed) * r;
-                pred_n(1) = B.row(1).dot(omega_seed) + A.row(1).dot(t_seed) * r;
-
-                Eigen::Vector2d err = flow_normalized[i] - pred_n;
-                double ex = err(0) * fx, ey = err(1) * fy;
-                double res_px = std::sqrt(ex * ex + ey * ey);
-                res_ratios.push_back(res_px / flow_magnitudes[i]);
-            }
-
-            thr_eval = compute_mad_threshold(res_ratios, 3.5);
-            thr_eval = std::max(cfg_.ransac_thresh_ratio * 0.25,
-                              std::min(thr_eval, cfg_.ransac_thresh_ratio * 2.0));
-        } catch (...) {
-            // Use default if seed fails
-        }
-    }
-
-    // RANSAC loop (sequential - parallel overhead too high for 100 iterations)
     Eigen::VectorXd best_theta;
     double best_score = -1.0;
     int no_improve = 0;
-    int patience = std::max(10, cfg_.ransac_max_iters / 10);
+    int patience = std::max(cfg.ransac_patience_min, cfg.ransac_max_iters / 10);
 
     std::mt19937 gen;
-    if (cfg_.seed == 0) {
-        std::random_device rd;
-        gen.seed(rd());
+    if (cfg.seed == 0) {
+        std::random_device rdev;
+        gen.seed(rdev());
     } else {
-        gen.seed(cfg_.seed);
+        gen.seed(cfg.seed);
     }
 
-    // Pre-allocate reusable buffers for RANSAC loop (avoid per-iteration heap allocation)
-    std::vector<bool> inlier_mask(n_points);
-    std::vector<double> weights_magsac(n_points);
-    std::vector<Eigen::Vector2d> pred_px_iter(n_points);
-    std::vector<Eigen::Vector2d> obs_px_iter(n_points);
-    std::vector<double> rel_residuals(n_points);
+    // Pre-allocate buffers reused across RANSAC iterations
+    std::vector<Eigen::Vector2d> pred_px;
+    std::vector<double> rel_residuals;
+    std::vector<int> sampled_cells;
+    std::vector<int> sample_indices;
+    sampled_cells.reserve(cfg.ransac_min_sample);
+    sample_indices.reserve(cfg.ransac_min_sample);
+    const int max_sample_rows = 2 * cfg.ransac_min_sample;
+    Eigen::MatrixXd M_sample(max_sample_rows, dof);
+    Eigen::VectorXd b_sample(max_sample_rows);
 
-    for (int iter = 0; iter < cfg_.ransac_max_iters; ++iter) {
+    for (int iter = 0; iter < cfg.ransac_max_iters; ++iter) {
         // Sample cells
-        int s_eff = std::min(cfg_.ransac_min_sample, static_cast<int>(unique_cells.size()));
+        int n_sample_cells = std::min(cfg.ransac_min_sample, static_cast<int>(unique_cells.size()));
 
-        std::vector<int> sampled_cells;
+        sampled_cells.clear();
         std::sample(unique_cells.begin(), unique_cells.end(),
-                   std::back_inserter(sampled_cells), s_eff, gen);
+                    std::back_inserter(sampled_cells), n_sample_cells, gen);
 
-        // Pick one point from each cell
-        std::vector<int> sample_indices;
+
+        sample_indices.clear();
         for (int cell : sampled_cells) {
             const auto& indices = cell_to_idx[cell];
-            if (indices.size() == 1) {
-                sample_indices.push_back(indices[0]);
-            } else {
-                std::uniform_int_distribution<> dis(0, indices.size() - 1);
-                sample_indices.push_back(indices[dis(gen)]);
-            }
+            std::uniform_int_distribution<> dis(0, static_cast<int>(indices.size()) - 1);
+            sample_indices.push_back(indices[dis(gen)]);
         }
 
-        // Build sample data
-        std::vector<Eigen::Vector2d> flow_sample, coords_sample;
-        std::vector<double> inv_depths_sample;
-        for (int idx : sample_indices) {
-            flow_sample.push_back(flow_normalized[idx]);
-            coords_sample.push_back(coords_normalized[idx]);
-            inv_depths_sample.push_back(inv_depths[idx]);
+        int n_sample = static_cast<int>(sample_indices.size());
+
+        // Build sample system: M_sample (2n × dof), b_sample from flow_eff
+        // Use pre-allocated buffer; only fill the first 2*n_sample rows
+        int rows_used = 2 * n_sample;
+        for (int j = 0; j < n_sample; ++j) {
+            int idx = sample_indices[j];
+            fill_system_row(B_all[idx], A_all[idx], d_rels[idx], 1.0,
+                            flow_eff[idx], translation_only, M_sample, b_sample, 2*j);
         }
 
-        // Check condition number - use pre-computed B, A matrices
-        // For constrained mode 2, we check condition of the 6-var system (mode 0)
-        // since the actual solve uses mode 0 first, then constrains
-        int n_vars_check = (cfg_.depth_scale_mode == 2) ? 6 : n_vars;
-        Eigen::MatrixXd M_sample(2 * sample_indices.size(), n_vars_check);
-        for (size_t i = 0; i < sample_indices.size(); ++i) {
-            int idx = sample_indices[i];
-            double r = inv_depths_sample[i];
-            const auto& B = B_all[idx];
-            const auto& A = A_all[idx];
+        // Solve via SVD (robust to near-singular systems)
+        auto M_block = M_sample.topRows(rows_used);
+        auto b_block = b_sample.head(rows_used);
+        auto svd = M_block.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV);
 
-            M_sample.block<1, 3>(2*i, 0) = B.row(0);
-            M_sample.block<1, 3>(2*i+1, 0) = B.row(1);
-            // Both mode 0 and constrained mode 2 use same structure for condition check
-            M_sample.block<1, 3>(2*i, 3) = A.row(0) * r;
-            M_sample.block<1, 3>(2*i+1, 3) = A.row(1) * r;
-        }
-
-        Eigen::MatrixXd G = M_sample.transpose() * M_sample;
-        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(G);
-        Eigen::VectorXd eigenvalues = es.eigenvalues();
-
-        double min_eval = eigenvalues.minCoeff();
-        double max_eval = eigenvalues.maxCoeff();
-        double cond_ratio = (max_eval > 1e-12) ? (std::sqrt(min_eval) / std::sqrt(max_eval)) : 0.0;
-
-        if (cond_ratio < 1e-4) {
+        // Skip degenerate samples via SVD singular value ratio
+        auto sv = svd.singularValues();
+        if (sv.size() > 0 && sv(sv.size() - 1) / std::max(sv(0), kEpsDenom) < cfg.ransac_cond_thresh) {
             no_improve++;
             if (no_improve >= patience) break;
             continue;
         }
 
-        // Solve for this sample
-        Eigen::VectorXd theta_s;
-        try {
-            theta_s = solve_least_squares(flow_sample, coords_sample, inv_depths_sample);
-        } catch (...) {
+        Eigen::VectorXd partial = svd.solve(b_block);
+
+        Eigen::VectorXd theta_hyp(kMotionDof);
+        if (translation_only)
+            theta_hyp << known_omega.value(), partial;
+        else
+            theta_hyp = partial;
+
+        if (!theta_hyp.allFinite()) {
             no_improve++;
             if (no_improve >= patience) break;
             continue;
         }
-        // Evaluate inliers with MAGSAC++ scoring using pre-computed B, A matrices
 
-        // Extract theta components for faster access
-        Eigen::Vector3d omega_s = theta_s.head<3>();
-        Eigen::Vector3d t_s;
-        double alpha_s = 0.0;
-        if (cfg_.depth_scale_mode == 2) {
-            // Constrained mode: theta = [omega(3), t(3), alpha(1)]
-            t_s = theta_s.segment<3>(3);
-            alpha_s = theta_s(6);
-        } else {
-            t_s = theta_s.tail<3>();
-        }
+        // Score: prediction from full theta vs raw obs_px (consistent for both modes)
+        Eigen::Vector3d omega_hyp = theta_hyp.head<3>();
+        Eigen::Vector3d t_hyp = theta_hyp.tail<3>();
 
-        // First pass: compute all predictions
-        for (int i = 0; i < n_points; ++i) {
-            double r = inv_depths[i];
-            const auto& B = B_all[i];
-            const auto& A = A_all[i];
+        eval_hypothesis(rd, omega_hyp, t_hyp, pred_px, rel_residuals);
 
-            // Constrained mode: flow = B @ omega + (r + alpha) * A @ t
-            double r_eff = (cfg_.depth_scale_mode == 2) ? (r + alpha_s) : r;
-            Eigen::Vector2d pred_n;
-            pred_n(0) = B.row(0).dot(omega_s) + A.row(0).dot(t_s) * r_eff;
-            pred_n(1) = B.row(1).dot(omega_s) + A.row(1).dot(t_s) * r_eff;
+        auto scoring = score_hypothesis(rel_residuals, pred_px, rd.obs_px, &rd.cell_ids, rd.max_cells, cfg);
 
-            pred_px_iter[i] = Eigen::Vector2d(pred_n(0) * fx, pred_n(1) * fy);
-            obs_px_iter[i] = Eigen::Vector2d(flow_normalized[i](0) * fx, flow_normalized[i](1) * fy);
-        }
-        // Scoring: MAGSAC++ (soft weighting) or MAD-based (binary threshold)
-        double score_s = 0.0;
-        int inlier_count = 0;
-
-        // First compute all relative residuals (buffer pre-allocated)
-        for (int i = 0; i < n_points; ++i) {
-            Eigen::Vector2d err = obs_px_iter[i] - pred_px_iter[i];
-            double res_px = err.norm();
-            rel_residuals[i] = res_px / flow_magnitudes[i];
-        }
-
-        if (cfg_.use_magsac_scoring) {
-            // MAGSAC++ scoring: weight = max(0, 1 - rel_res / rel_sigma_max)
-            double rel_sigma_max = cfg_.magsac_rel_sigma_max;
-            double inlier_weight_thresh = cfg_.magsac_inlier_weight;
-
-            for (int i = 0; i < n_points; ++i) {
-                double rel_res = rel_residuals[i];
-                double weight = std::max(0.0, 1.0 - rel_res / rel_sigma_max);
-                weights_magsac[i] = weight;
-                score_s += weight;
-
-                inlier_mask[i] = (weight >= inlier_weight_thresh);
-                if (inlier_mask[i]) {
-                    inlier_count++;
-                }
-            }
-        } else {
-            // MAD-based scoring (paper method): binary threshold from median + k*MAD
-            // Plus direction check when use_direction_check is enabled (Supplementary 2.3)
-            std::vector<double> sorted_res = rel_residuals;
-            std::nth_element(sorted_res.begin(), sorted_res.begin() + n_points/2, sorted_res.end());
-            double median_res = sorted_res[n_points/2];
-
-            std::vector<double> abs_dev(n_points);
-            for (int i = 0; i < n_points; ++i) {
-                abs_dev[i] = std::abs(rel_residuals[i] - median_res);
-            }
-            std::nth_element(abs_dev.begin(), abs_dev.begin() + n_points/2, abs_dev.end());
-            double mad = abs_dev[n_points/2] + 1e-8;
-
-            // Threshold from MAD (using ransac_thresh_ratio as k)
-            double thresh = median_res + cfg_.ransac_thresh_ratio * mad;
-            thresh = std::max(0.05, std::min(thresh, 0.5));  // Clamp to reasonable range
-
-            for (int i = 0; i < n_points; ++i) {
-                bool is_inlier = (rel_residuals[i] <= thresh);
-
-                // Direction check (paper Supplementary 2.3): reject if direction deviation too large
-                if (is_inlier && cfg_.use_direction_check) {
-                    double pred_mag = pred_px_iter[i].norm() + 1e-12;
-                    double obs_mag = obs_px_iter[i].norm() + 1e-12;
-                    double cos_sim = pred_px_iter[i].dot(obs_px_iter[i]) / (pred_mag * obs_mag);
-                    // cos_sim_thresh = 0.5 means reject if angle > 60 degrees
-                    if (cos_sim < cfg_.cos_sim_thresh) {
-                        is_inlier = false;
-                    }
-                }
-
-                inlier_mask[i] = is_inlier;
-                if (inlier_mask[i]) {
-                    inlier_count++;
-                    score_s += 1.0;  // Binary: each inlier contributes 1
-                }
-                weights_magsac[i] = inlier_mask[i] ? 1.0 : 0.0;
-            }
-        }
-
-        // Add cell coverage bonus
-        double coverage_bonus = compute_coverage_score(inlier_mask, cell_ids, max_cells, 1.0) - inlier_count;
-        score_s += coverage_bonus;
-
-        // NOTE: Per paper, IRLS refinement is done only AFTER RANSAC selects best hypothesis
-        // "After RANSAC selects the best hypothesis, we refine the parameters using
-        //  a small number of IRLS iterations" - Supplementary Material Section 2.4
-
-        // Update best
-        if (score_s > best_score) {
-            best_theta = theta_s;
-            best_score = score_s;
+        if (scoring.score > best_score) {
+            best_theta = theta_hyp;
+            best_score = scoring.score;
             no_improve = 0;
         } else {
             no_improve++;
@@ -931,542 +441,383 @@ Eigen::VectorXd MotionFieldEstimator::ransac_estimate(
         throw std::runtime_error("RANSAC failed to find valid solution");
     }
 
-    // Final IRLS refinement on all inliers - use pre-computed B, A matrices
-    std::vector<bool> final_inlier_mask(n_points);
+    // IRLS refinement on inliers
     Eigen::Vector3d omega_final = best_theta.head<3>();
-    Eigen::Vector3d t_final;
-    double alpha_final = 0.0;
-    if (cfg_.depth_scale_mode == 2) {
-        // Constrained mode: theta = [omega(3), t(3), alpha(1)]
-        t_final = best_theta.segment<3>(3);
-        alpha_final = best_theta(6);
-    } else {
-        t_final = best_theta.tail<3>();
-    }
+    Eigen::Vector3d t_final = best_theta.tail<3>();
 
-    // Compute residuals for final inlier selection
-    // Also cache pred_px/obs_px for direction check reuse
-    std::vector<double> final_rel_residuals(n_points);
+    std::vector<Eigen::Vector2d> final_pred_px;
+    std::vector<double> final_rel_residuals;
+    eval_hypothesis(rd, omega_final, t_final, final_pred_px, final_rel_residuals);
+
+    auto final_scoring = score_hypothesis(final_rel_residuals, final_pred_px, rd.obs_px, nullptr, 0, cfg);
+
+    // Build inlier-only RansacData for IRLS refinement
+    std::vector<Eigen::Vector2d> inlier_flow;
+    RansacData inlier_rd;
+    inlier_rd.fx = rd.fx;
+    inlier_rd.fy = rd.fy;
+    int n_inliers_est = final_scoring.inlier_count;
+    inlier_flow.reserve(n_inliers_est);
+    inlier_rd.B_all.reserve(n_inliers_est);
+    inlier_rd.A_all.reserve(n_inliers_est);
+    inlier_rd.obs_px.reserve(n_inliers_est);
+    inlier_rd.d_rels.reserve(n_inliers_est);
+    inlier_rd.flow_mags.reserve(n_inliers_est);
     for (int i = 0; i < n_points; ++i) {
-        double r = inv_depths[i];
-        const auto& B = B_all[i];
-        const auto& A = A_all[i];
-
-        double r_eff = (cfg_.depth_scale_mode == 2) ? (r + alpha_final) : r;
-        Eigen::Vector2d pred_n;
-        pred_n(0) = B.row(0).dot(omega_final) + A.row(0).dot(t_final) * r_eff;
-        pred_n(1) = B.row(1).dot(omega_final) + A.row(1).dot(t_final) * r_eff;
-
-        pred_px_iter[i] = Eigen::Vector2d(pred_n(0) * fx, pred_n(1) * fy);
-        obs_px_iter[i] = Eigen::Vector2d(flow_normalized[i](0) * fx, flow_normalized[i](1) * fy);
-
-        Eigen::Vector2d err = obs_px_iter[i] - pred_px_iter[i];
-        double res_px = err.norm();
-        final_rel_residuals[i] = res_px / flow_magnitudes[i];
-    }
-
-    // Final inlier selection using same method as RANSAC scoring
-    if (cfg_.use_magsac_scoring) {
-        double rel_sigma_max = cfg_.magsac_rel_sigma_max;
-        double inlier_weight_thresh = cfg_.magsac_inlier_weight;
-        for (int i = 0; i < n_points; ++i) {
-            double weight = std::max(0.0, 1.0 - final_rel_residuals[i] / rel_sigma_max);
-            final_inlier_mask[i] = (weight >= inlier_weight_thresh);
-        }
-    } else {
-        // MAD-based threshold with direction check
-        std::vector<double> sorted_res = final_rel_residuals;
-        std::nth_element(sorted_res.begin(), sorted_res.begin() + n_points/2, sorted_res.end());
-        double median_res = sorted_res[n_points/2];
-
-        std::vector<double> abs_dev(n_points);
-        for (int i = 0; i < n_points; ++i) {
-            abs_dev[i] = std::abs(final_rel_residuals[i] - median_res);
-        }
-        std::nth_element(abs_dev.begin(), abs_dev.begin() + n_points/2, abs_dev.end());
-        double mad = abs_dev[n_points/2] + 1e-8;
-
-        double thresh = median_res + cfg_.ransac_thresh_ratio * mad;
-        thresh = std::max(0.05, std::min(thresh, 0.5));
-
-        for (int i = 0; i < n_points; ++i) {
-            bool is_inlier = (final_rel_residuals[i] <= thresh);
-
-            // Direction check for final inlier selection (reuse cached pred/obs)
-            if (is_inlier && cfg_.use_direction_check) {
-                double pred_mag = pred_px_iter[i].norm() + 1e-12;
-                double obs_mag = obs_px_iter[i].norm() + 1e-12;
-                double cos_sim = pred_px_iter[i].dot(obs_px_iter[i]) / (pred_mag * obs_mag);
-                if (cos_sim < cfg_.cos_sim_thresh) {
-                    is_inlier = false;
-                }
-            }
-
-            final_inlier_mask[i] = is_inlier;
+        if (final_scoring.inlier_mask[i]) {
+            inlier_flow.push_back(flow_normalized[i]);
+            inlier_rd.B_all.push_back(B_all[i]);
+            inlier_rd.A_all.push_back(A_all[i]);
+            inlier_rd.obs_px.push_back(rd.obs_px[i]);
+            inlier_rd.d_rels.push_back(rd.d_rels[i]);
+            inlier_rd.flow_mags.push_back(rd.flow_mags[i]);
         }
     }
 
-    std::vector<Eigen::Vector2d> flow_final, coords_final;
-    std::vector<double> inv_depths_final;
-
-    for (int i = 0; i < n_points; ++i) {
-        if (final_inlier_mask[i]) {
-            flow_final.push_back(flow_normalized[i]);
-            coords_final.push_back(coords_normalized[i]);
-            inv_depths_final.push_back(inv_depths[i]);
-        }
-    }
-
-    int min_inliers_for_refine = (cfg_.depth_scale_mode == 2) ? 7 : 6;  // 7 for constrained mode
-    if (static_cast<int>(flow_final.size()) >= min_inliers_for_refine) {
-        best_theta = refine_irls(flow_final, coords_final, inv_depths_final, best_theta, intrinsics);
+    if (static_cast<int>(inlier_flow.size()) >= dof) {
+        best_theta = refine_irls(inlier_flow, inlier_rd, best_theta, cfg, known_omega);
     }
 
     return best_theta;
 }
 
-MotionFieldResult MotionFieldEstimator::estimate(
+} // namespace motion
+
+MotionFieldEstimator::MotionFieldEstimator(const MotionFieldConfig& cfg,
+                                           const CameraIntrinsics& intrinsics)
+    : cfg_(cfg),
+      fx_(intrinsics.fx), fy_(intrinsics.fy),
+      inv_fx_(1.0 / intrinsics.fx), inv_fy_(1.0 / intrinsics.fy),
+      cx_(intrinsics.cx), cy_(intrinsics.cy) {}
+
+// depth_subsample: Depth-stratified subsampling
+void MotionFieldEstimator::depth_subsample(CollectedPoints& pts, const MotionFieldConfig& cfg) {
+    int n_total = static_cast<int>(pts.coords_normalized.size());
+    int n_depth_bins = cfg.depth_bins;
+    int max_cells = pts.max_cells;
+
+    // --- Depth-stratified subsampling ---
+    // Compute depth percentiles for binning using nth_element (O(n) instead of O(n log n))
+    std::vector<double> pct_d_rels = pts.d_rels;
+    constexpr float kDepthPctLo = 0.02f;
+    constexpr float kDepthPctHi = 0.98f;
+    int p2_idx  = std::max(0, static_cast<int>(n_total * kDepthPctLo));
+    int p98_idx = std::min(n_total - 1, static_cast<int>(n_total * kDepthPctHi));
+    std::nth_element(pct_d_rels.begin(), pct_d_rels.begin() + p2_idx, pct_d_rels.end());
+    double d_rel_lo = pct_d_rels[p2_idx];
+    std::nth_element(pct_d_rels.begin() + p2_idx, pct_d_rels.begin() + p98_idx, pct_d_rels.end());
+    double d_rel_hi = pct_d_rels[p98_idx];
+
+    if (d_rel_hi <= d_rel_lo) {
+        d_rel_hi = d_rel_lo + kEpsRange;
+    }
+    double inv_span = static_cast<double>(n_depth_bins) / (d_rel_hi - d_rel_lo);
+
+
+    std::vector<int> depth_bin_ids(n_total);
+    for (int i = 0; i < n_total; ++i) {
+        double d_rel_clipped = std::max(d_rel_lo, std::min(d_rel_hi, pts.d_rels[i]));
+        int bin = static_cast<int>((d_rel_clipped - d_rel_lo) * inv_span);
+        depth_bin_ids[i] = std::max(0, std::min(n_depth_bins - 1, bin));
+    }
+
+    // Create composite bucket key: depth_bin * n_cells + cell_id
+    int n_buckets = n_depth_bins * max_cells;
+    std::vector<std::vector<int>> bucket_indices(n_buckets);
+
+    for (int i = 0; i < n_total; ++i) {
+        int bucket_key = depth_bin_ids[i] * max_cells + pts.cell_ids[i];
+        bucket_indices[bucket_key].push_back(i);
+    }
+
+    // Count non-empty buckets and their sizes
+    std::vector<int> non_empty_buckets;
+    std::vector<int> bucket_sizes;
+    for (int b = 0; b < n_buckets; ++b) {
+        if (!bucket_indices[b].empty()) {
+            non_empty_buckets.push_back(b);
+            bucket_sizes.push_back(static_cast<int>(bucket_indices[b].size()));
+        }
+    }
+
+    int n_non_empty = static_cast<int>(non_empty_buckets.size());
+    if (n_non_empty == 0) {
+        throw std::runtime_error("No valid buckets for stratified sampling");
+    }
+
+    // Allocate quota to each bucket proportionally
+    std::vector<int> quota(n_non_empty);
+    int total_points = 0;
+    for (int i = 0; i < n_non_empty; ++i) {
+        total_points += bucket_sizes[i];
+    }
+
+    // Proportional allocation with remaining distribution
+    int remaining = cfg.max_points;
+    for (int i = 0; i < n_non_empty; ++i) {
+        int alloc = std::max(1, static_cast<int>(
+            static_cast<double>(bucket_sizes[i]) / total_points * cfg.max_points));
+        alloc = std::min(alloc, bucket_sizes[i]);
+        alloc = std::min(alloc, remaining);
+        quota[i] = alloc;
+        remaining -= alloc;
+    }
+    // Distribute remaining quota
+    while (remaining > 0) {
+        bool can_add = false;
+        for (int i = 0; i < n_non_empty && remaining > 0; ++i) {
+            if (quota[i] < bucket_sizes[i]) {
+                quota[i]++;
+                remaining--;
+                can_add = true;
+            }
+        }
+        if (!can_add) break;
+    }
+
+    // Sample from each bucket
+    std::vector<int> sampled_indices;
+    sampled_indices.reserve(cfg.max_points);
+
+    for (int i = 0; i < n_non_empty; ++i) {
+        int bucket_id = non_empty_buckets[i];
+        auto& indices = bucket_indices[bucket_id];
+        int q = quota[i];
+
+        // Deterministic: take evenly spaced points
+        if (q >= static_cast<int>(indices.size())) {
+            for (int idx : indices) {
+                sampled_indices.push_back(idx);
+            }
+        } else {
+            double step = static_cast<double>(indices.size()) / q;
+            for (int j = 0; j < q; ++j) {
+                sampled_indices.push_back(indices[static_cast<int>(j * step)]);
+            }
+        }
+    }
+
+    std::vector<Eigen::Vector2d> flow_sampled, coords_sampled;
+    std::vector<double> d_rels_sampled;
+    std::vector<int> cell_ids_sampled;
+
+    flow_sampled.reserve(sampled_indices.size());
+    coords_sampled.reserve(sampled_indices.size());
+    d_rels_sampled.reserve(sampled_indices.size());
+    cell_ids_sampled.reserve(sampled_indices.size());
+
+    for (int idx : sampled_indices) {
+        flow_sampled.push_back(pts.flow_normalized[idx]);
+        coords_sampled.push_back(pts.coords_normalized[idx]);
+        d_rels_sampled.push_back(pts.d_rels[idx]);
+        cell_ids_sampled.push_back(pts.cell_ids[idx]);
+    }
+
+    pts.flow_normalized   = std::move(flow_sampled);
+    pts.coords_normalized = std::move(coords_sampled);
+    pts.d_rels            = std::move(d_rels_sampled);
+    pts.cell_ids          = std::move(cell_ids_sampled);
+}
+
+
+// pixel_norms: Flow pixel magnitude computation
+void MotionFieldEstimator::pixel_norms(CollectedPoints& pts, double fx, double fy,
+                                       float min_flow_px) {
+    // --- [4] Flow pixel magnitudes ---
+    pts.flow_mags.resize(pts.flow_normalized.size());
+    for (size_t i = 0; i < pts.flow_normalized.size(); ++i) {
+        pts.flow_mags[i] = std::sqrt(
+            std::pow(pts.flow_normalized[i](0) * fx, 2) +
+            std::pow(pts.flow_normalized[i](1) * fy, 2)
+        );
+        pts.flow_mags[i] = std::max(pts.flow_mags[i], static_cast<double>(min_flow_px));
+    }
+}
+
+// collect_points: Gather and subsample valid points from flow/depth images
+MotionFieldEstimator::CollectedPoints MotionFieldEstimator::collect_points(
     const cv::Mat& flow,
-    const cv::Mat& inv_depth,
-    const CameraIntrinsics& intrinsics,
-    const cv::Mat& mask,
-    const std::optional<Eigen::Vector3d>& known_omega) {
-
-    if (flow.type() != CV_32FC2) {
-        throw std::runtime_error("Flow must be CV_32FC2");
-    }
-    if (inv_depth.type() != CV_32F) {
-        throw std::runtime_error("Inverse depth must be CV_32F");
-    }
-    if (flow.size() != inv_depth.size()) {
-        throw std::runtime_error("Flow and inverse depth must have same size");
-    }
-
-    // Translation-only mode: when known_omega is provided
-    const bool translation_only = known_omega.has_value();
+    const cv::Mat& d_rel,
+    const cv::Mat& mask) {
 
     int H = flow.rows;
     int W = flow.cols;
-
-    // Compute 3rd percentile for filtering
-    float r_percentile_3 = 0.0f;
-    {
-        std::vector<float> valid_inv_depths;
-        for (int y = 0; y < H; ++y) {
-            const float* row = inv_depth.ptr<float>(y);
-            for (int x = 0; x < W; ++x) {
-                float r = row[x];
-                if (std::isfinite(r)) {
-                    valid_inv_depths.push_back(r);
-                }
-            }
-        }
-        if (!valid_inv_depths.empty()) {
-            std::nth_element(valid_inv_depths.begin(),
-                           valid_inv_depths.begin() + valid_inv_depths.size() * 3 / 100,
-                           valid_inv_depths.end());
-            r_percentile_3 = valid_inv_depths[valid_inv_depths.size() * 3 / 100];
-        }
-    }
-
-    // Assign cells (grid)
-    int grid_cols = 6;
-    int grid_rows = 4;
+    int grid_cols = cfg_.grid_cols;
+    int grid_rows = cfg_.grid_rows;
     int max_cells = grid_rows * grid_cols;
 
-    // Collect ALL valid points with cell IDs (for inlier computation after RANSAC)
-    // Reserve capacity to avoid reallocations (estimate ~50% valid)
-    int estimated_valid = H * W / 2;
-    std::vector<Eigen::Vector2d> all_flow_normalized;
-    std::vector<Eigen::Vector2d> all_coords_normalized;
-    std::vector<double> all_inv_depths_vec;
-    std::vector<int> all_cell_ids;
-    std::vector<float> all_pixel_x, all_pixel_y;
-    std::vector<float> all_flow_u, all_flow_v;
-    all_flow_normalized.reserve(estimated_valid);
-    all_coords_normalized.reserve(estimated_valid);
-    all_inv_depths_vec.reserve(estimated_valid);
-    all_cell_ids.reserve(estimated_valid);
-    all_pixel_x.reserve(estimated_valid);
-    all_pixel_y.reserve(estimated_valid);
-    all_flow_u.reserve(estimated_valid);
-    all_flow_v.reserve(estimated_valid);
-
-    // Pre-compute constants
-    double inv_fx = 1.0 / intrinsics.fx;
-    double inv_fy = 1.0 / intrinsics.fy;
-    double cx_d = intrinsics.cx;
-    double cy_d = intrinsics.cy;
-    float min_flow_px_base = cfg_.min_flow_px;
-    float adaptive_scale = cfg_.adaptive_flow_depth_scale;
-
-    // Margin boundaries (exclude edge pixels)
+    // Margin boundaries
     int margin_x = static_cast<int>(W * cfg_.margin_x_pct);
     int margin_y = static_cast<int>(H * cfg_.margin_y_pct);
-    int x_min = margin_x;
-    int x_max = W - margin_x;
-    int y_min = margin_y;
-    int y_max = H - margin_y;
 
-    // Use raw pointer access for cv::Mat (faster than .at<>())
-    const float* inv_depth_ptr = inv_depth.ptr<float>();
-    const cv::Vec2f* flow_ptr = flow.ptr<cv::Vec2f>();
-    const uint8_t* mask_ptr = mask.empty() ? nullptr : mask.ptr<uint8_t>();
+    // Build valid pixel mask using OpenCV matrix ops (SIMD-accelerated)
+    cv::Mat flow_channels[2];
+    cv::split(flow, flow_channels);
+    const cv::Mat& flow_x = flow_channels[0];
+    const cv::Mat& flow_y = flow_channels[1];
 
-    for (int y = y_min; y < y_max; ++y) {
-        int row_offset = y * W;
-        for (int x = x_min; x < x_max; ++x) {
-            int idx = row_offset + x;
+    // d_rel > 0 and finite (NaN > 0 is false, so this handles both)
+    cv::Mat valid = (d_rel > 0);
 
-            if (mask_ptr && mask_ptr[idx] == 0) continue;
+    // flow finite: NaN != NaN, so (flow_x == flow_x) is false for NaN
+    cv::Mat fx_finite, fy_finite;
+    cv::compare(flow_x, flow_x, fx_finite, cv::CMP_EQ);
+    cv::compare(flow_y, flow_y, fy_finite, cv::CMP_EQ);
+    valid &= fx_finite;
+    valid &= fy_finite;
 
-            float r = inv_depth_ptr[idx];
-            const cv::Vec2f& f = flow_ptr[idx];
+    // flow magnitude > min_flow
+    cv::Mat flow_mag_sq = flow_x.mul(flow_x) + flow_y.mul(flow_y);
+    float min_flow_sq = cfg_.min_flow_px * cfg_.min_flow_px;
+    valid &= (flow_mag_sq > min_flow_sq);
 
-            if (!std::isfinite(r) || r <= r_percentile_3) continue;
-            if (!std::isfinite(f[0]) || !std::isfinite(f[1])) continue;
+    // External mask
+    if (!mask.empty()) valid &= mask;
 
-            // Adaptive min_flow: far objects (low inv_depth) allow smaller flow
-            // near objects (high inv_depth) require larger flow
-            float adaptive_min_flow = min_flow_px_base / (1.0f + adaptive_scale * r);
-            float adaptive_min_flow_sq = adaptive_min_flow * adaptive_min_flow;
-
-            float flow_mag_sq = f[0] * f[0] + f[1] * f[1];
-            if (flow_mag_sq < adaptive_min_flow_sq) continue;
-
-            // Cell ID
-            int cx = std::min(x * grid_cols / W, grid_cols - 1);
-            int cy_grid = std::min(y * grid_rows / H, grid_rows - 1);
-            int cell_id = cy_grid * grid_cols + cx;
-
-            double x_norm = (x - cx_d) * inv_fx;
-            double y_norm = (y - cy_d) * inv_fy;
-            double u_norm = f[0] * inv_fx;
-            double v_norm = f[1] * inv_fy;
-
-            // Store in ALL vectors (for inlier computation)
-            all_coords_normalized.emplace_back(x_norm, y_norm);
-            all_flow_normalized.emplace_back(u_norm, v_norm);
-            all_inv_depths_vec.push_back(static_cast<double>(r));
-            all_cell_ids.push_back(cell_id);
-            all_pixel_x.push_back(static_cast<float>(x));
-            all_pixel_y.push_back(static_cast<float>(y));
-            all_flow_u.push_back(f[0]);
-            all_flow_v.push_back(f[1]);
-        }
+    // Apply margin (zero out edges)
+    if (margin_y > 0) {
+        valid.rowRange(0, margin_y).setTo(0);
+        valid.rowRange(H - margin_y, H).setTo(0);
+    }
+    if (margin_x > 0) {
+        valid.colRange(0, margin_x).setTo(0);
+        valid.colRange(W - margin_x, W).setTo(0);
     }
 
-    if (all_coords_normalized.size() < 6) {
+    // Extract valid pixel coordinates
+    std::vector<cv::Point> valid_coords;
+    cv::findNonZero(valid, valid_coords);
+    int n_valid = static_cast<int>(valid_coords.size());
+
+    // Collect points from valid coordinates
+    const float* d_rel_ptr = d_rel.ptr<float>();
+    const cv::Vec2f* flow_ptr = flow.ptr<cv::Vec2f>();
+
+    CollectedPoints pts;
+    pts.max_cells = max_cells;
+    pts.all_flow_normalized.resize(n_valid);
+    pts.all_coords_normalized.resize(n_valid);
+    pts.all_d_rels.resize(n_valid);
+    pts.cell_ids.resize(n_valid);
+    pts.all_matches.u0.resize(n_valid);
+    pts.all_matches.v0.resize(n_valid);
+    pts.all_matches.u1.resize(n_valid);
+    pts.all_matches.v1.resize(n_valid);
+
+    for (int i = 0; i < n_valid; ++i) {
+        int x = valid_coords[i].x;
+        int y = valid_coords[i].y;
+        int idx = y * W + x;
+        float d_val = d_rel_ptr[idx];
+        const cv::Vec2f& f = flow_ptr[idx];
+
+        pts.all_coords_normalized[i] = Eigen::Vector2d((x - cx_) * inv_fx_, (y - cy_) * inv_fy_);
+        pts.all_flow_normalized[i] = Eigen::Vector2d(f[0] * inv_fx_, f[1] * inv_fy_);
+        pts.all_d_rels[i] = static_cast<double>(d_val);
+        pts.cell_ids[i] = std::min(y * grid_rows / H, grid_rows - 1) * grid_cols
+                        + std::min(x * grid_cols / W, grid_cols - 1);
+        pts.all_matches.u0[i] = static_cast<float>(x);
+        pts.all_matches.v0[i] = static_cast<float>(y);
+        pts.all_matches.u1[i] = static_cast<float>(x) + f[0];
+        pts.all_matches.v1[i] = static_cast<float>(y) + f[1];
+    }
+
+    if (pts.all_coords_normalized.size() < 6) {
         std::ostringstream oss;
         oss << "Not enough valid points for motion estimation: "
-            << all_coords_normalized.size() << " points (need >= 6)"
-            << ", r_percentile_3=" << r_percentile_3
-            << ", min_flow_px=" << cfg_.min_flow_px
-            << ", adaptive_flow_depth_scale=" << cfg_.adaptive_flow_depth_scale;
+            << pts.all_coords_normalized.size() << " points (need >= 6)";
         throw std::runtime_error(oss.str());
     }
 
-    // Subsampled vectors (only populated if needed, avoids ~12MB copy when not subsampling)
-    std::vector<Eigen::Vector2d> flow_sub, coords_sub;
-    std::vector<double> inv_depths_sub;
-    std::vector<int> cell_ids_sub;
-    bool need_subsample = all_coords_normalized.size() > static_cast<size_t>(cfg_.max_points);
+    // Subsample if too many points; otherwise use all points directly
+    if (pts.all_coords_normalized.size() > static_cast<size_t>(cfg_.max_points)) {
+        // Copy needed: depth_subsample will replace these with subsampled versions
+        pts.flow_normalized   = pts.all_flow_normalized;
+        pts.coords_normalized = pts.all_coords_normalized;
+        pts.d_rels            = pts.all_d_rels;
+        depth_subsample(pts, cfg_);
+    } else {
+        // No subsampling: point directly to all_* data
 
-    if (need_subsample) {
-        std::mt19937 gen_shuffle;
-        if (cfg_.seed == 0) {
-            std::random_device rd;
-            gen_shuffle.seed(rd());
-        } else {
-            gen_shuffle.seed(cfg_.seed + 1);
-        }
-
-        int n_total = static_cast<int>(all_coords_normalized.size());
-        int n_depth_bins = cfg_.depth_bins;
-
-        // Compute depth percentiles for binning (2nd and 98th percentile)
-        // Use nth_element O(n) instead of full sort O(n log n)
-        std::vector<double> depth_pct = all_inv_depths_vec;
-        int p2_idx = std::max(0, static_cast<int>(n_total * 0.02));
-        int p98_idx = std::min(n_total - 1, static_cast<int>(n_total * 0.98));
-        std::nth_element(depth_pct.begin(), depth_pct.begin() + p98_idx, depth_pct.end());
-        double depth_hi = depth_pct[p98_idx];
-        std::nth_element(depth_pct.begin(), depth_pct.begin() + p2_idx, depth_pct.begin() + p98_idx);
-        double depth_lo = depth_pct[p2_idx];
-
-        if (depth_hi <= depth_lo) {
-            depth_hi = depth_lo + 1e-6;
-        }
-        double inv_span = static_cast<double>(n_depth_bins) / (depth_hi - depth_lo);
-
-        // Assign depth bin to each point
-        std::vector<int> depth_bin_ids(n_total);
-        for (int i = 0; i < n_total; ++i) {
-            double d_clipped = std::max(depth_lo, std::min(depth_hi, all_inv_depths_vec[i]));
-            int bin = static_cast<int>((d_clipped - depth_lo) * inv_span);
-            depth_bin_ids[i] = std::max(0, std::min(n_depth_bins - 1, bin));
-        }
-
-        // Create composite bucket key: depth_bin * n_cells + cell_id
-        int n_buckets = n_depth_bins * max_cells;
-        std::vector<std::vector<int>> bucket_indices(n_buckets);
-
-        for (int i = 0; i < n_total; ++i) {
-            int bucket_key = depth_bin_ids[i] * max_cells + all_cell_ids[i];
-            bucket_indices[bucket_key].push_back(i);
-        }
-
-        // Count non-empty buckets and their sizes
-        std::vector<int> non_empty_buckets;
-        std::vector<int> bucket_sizes;
-        for (int b = 0; b < n_buckets; ++b) {
-            if (!bucket_indices[b].empty()) {
-                non_empty_buckets.push_back(b);
-                bucket_sizes.push_back(static_cast<int>(bucket_indices[b].size()));
-            }
-        }
-
-        int n_non_empty = static_cast<int>(non_empty_buckets.size());
-        if (n_non_empty == 0) {
-            throw std::runtime_error("No valid buckets for stratified sampling");
-        }
-
-        // Allocate quota to each bucket proportionally
-        std::vector<int> quota(n_non_empty);
-        int total_points = 0;
-        for (int i = 0; i < n_non_empty; ++i) {
-            total_points += bucket_sizes[i];
-        }
-
-        int remaining = cfg_.max_points;
-        for (int i = 0; i < n_non_empty; ++i) {
-            // Proportional allocation with at least 1 per bucket
-            int alloc = std::max(1, static_cast<int>(
-                static_cast<double>(bucket_sizes[i]) / total_points * cfg_.max_points));
-            alloc = std::min(alloc, bucket_sizes[i]);
-            alloc = std::min(alloc, remaining);
-            quota[i] = alloc;
-            remaining -= alloc;
-        }
-
-        // Distribute remaining quota
-        while (remaining > 0) {
-            for (int i = 0; i < n_non_empty && remaining > 0; ++i) {
-                if (quota[i] < bucket_sizes[i]) {
-                    quota[i]++;
-                    remaining--;
-                }
-            }
-            // Break if no bucket can accept more
-            bool can_add = false;
-            for (int i = 0; i < n_non_empty; ++i) {
-                if (quota[i] < bucket_sizes[i]) {
-                    can_add = true;
-                    break;
-                }
-            }
-            if (!can_add) break;
-        }
-
-        // Sample from each bucket
-        std::vector<int> sampled_indices;
-        sampled_indices.reserve(cfg_.max_points);
-
-        for (int i = 0; i < n_non_empty; ++i) {
-            int bucket_id = non_empty_buckets[i];
-            auto& indices = bucket_indices[bucket_id];
-            int q = quota[i];
-
-            if (q >= static_cast<int>(indices.size())) {
-                // Take all
-                for (int idx : indices) {
-                    sampled_indices.push_back(idx);
-                }
-            } else {
-                // Random sample without replacement
-                std::vector<int> shuffled = indices;
-                std::shuffle(shuffled.begin(), shuffled.end(), gen_shuffle);
-                for (int j = 0; j < q; ++j) {
-                    sampled_indices.push_back(shuffled[j]);
-                }
-            }
-        }
-
-        // Build sampled vectors (only the 4 needed for RANSAC)
-        std::vector<Eigen::Vector2d> flow_sampled, coords_sampled;
-        std::vector<double> inv_depths_sampled;
-        std::vector<int> cell_ids_sampled;
-
-        flow_sampled.reserve(sampled_indices.size());
-        coords_sampled.reserve(sampled_indices.size());
-        inv_depths_sampled.reserve(sampled_indices.size());
-        cell_ids_sampled.reserve(sampled_indices.size());
-
-        for (int idx : sampled_indices) {
-            flow_sampled.push_back(all_flow_normalized[idx]);
-            coords_sampled.push_back(all_coords_normalized[idx]);
-            inv_depths_sampled.push_back(all_inv_depths_vec[idx]);
-            cell_ids_sampled.push_back(all_cell_ids[idx]);
-        }
-
-        flow_sub = std::move(flow_sampled);
-        coords_sub = std::move(coords_sampled);
-        inv_depths_sub = std::move(inv_depths_sampled);
-        cell_ids_sub = std::move(cell_ids_sampled);
+        pts.flow_normalized   = pts.all_flow_normalized;
+        pts.coords_normalized = pts.all_coords_normalized;
+        pts.d_rels            = pts.all_d_rels;
     }
-
-    // References to vectors for RANSAC (avoids ~12MB copy when no subsampling needed)
-    const auto& flow_normalized = need_subsample ? flow_sub : all_flow_normalized;
-    const auto& coords_normalized = need_subsample ? coords_sub : all_coords_normalized;
-    const auto& inv_depths_vec = need_subsample ? inv_depths_sub : all_inv_depths_vec;
-    const auto& cell_ids = need_subsample ? cell_ids_sub : all_cell_ids;
 
     // Compute flow magnitudes for RANSAC
-    double fx = intrinsics.fx;
-    double fy = intrinsics.fy;
-    std::vector<double> flow_mags(flow_normalized.size());
-    for (size_t i = 0; i < flow_normalized.size(); ++i) {
-        double fmx = flow_normalized[i](0) * fx, fmy = flow_normalized[i](1) * fy;
-        flow_mags[i] = std::sqrt(fmx * fmx + fmy * fmy);
-        flow_mags[i] = std::max(flow_mags[i], static_cast<double>(cfg_.min_flow_px));
-    }
+    pixel_norms(pts, fx_, fy_, cfg_.min_flow_px);
 
-    // Extract rotation and translation
-    Eigen::Vector3d omega;
-    Eigen::Vector3d t_cam;
-    double depth_scale = 1.0;
-    double depth_offset = 0.0;
-
-    if (translation_only) {
-        // ===== Translation-only mode: use known rotation =====
-        omega = known_omega.value();
-
-        // Run translation-only RANSAC
-        t_cam = ransac_estimate_translation_only(
-            flow_normalized, coords_normalized, inv_depths_vec,
-            flow_mags, cell_ids, intrinsics, max_cells,
-            omega, cfg_);
-
-    } else {
-        // ===== Full estimation: joint rotation + translation =====
-        // Run RANSAC
-        Eigen::VectorXd theta = ransac_estimate(
-            flow_normalized, coords_normalized, inv_depths_vec,
-            flow_mags, cell_ids, intrinsics, max_cells);
-
-        // Extract rotation and translation based on depth_scale_mode
-        omega = theta.head<3>();
-
-        if (cfg_.depth_scale_mode == 2) {
-            // Constrained mode: theta = [omega(3), t(3), alpha(1)]
-            // flow = B @ omega + (r + alpha) * A @ t
-            // This models: r' = s * r + o where r' = (r + alpha), so:
-            //   - depth_scale s = ||t|| (implicit in t magnitude)
-            //   - depth_offset o = alpha (additive offset to inverse depth)
-            // t_cam is the full translation vector (includes scale)
-            t_cam = theta.segment<3>(3);
-            double alpha = theta(6);
-
-            // For output, normalize t to unit direction and record scale
-            double t_norm = t_cam.norm();
-            if (t_norm > 1e-8) {
-                depth_scale = t_norm;
-                t_cam = t_cam / t_norm;  // Normalize to unit direction
-            }
-            depth_offset = alpha;  // Direct offset on inverse depth
-        } else {
-            // Standard mode
-            t_cam = theta.tail<3>();
-        }
-    }
-
-    // Convert rotation vector to matrix (camera rotation)
-    double angle = omega.norm();
-    Eigen::Matrix3d R_cam;
-    if (angle < 1e-8) {
-        R_cam = Eigen::Matrix3d::Identity();
-    } else {
-        Eigen::Vector3d axis = omega / angle;
-        Eigen::Matrix3d K;
-        K <<      0,  -axis(2),   axis(1),
-              axis(2),        0,  -axis(0),
-             -axis(1),   axis(0),        0;
-
-        R_cam = Eigen::Matrix3d::Identity() + std::sin(angle) * K + (1.0 - std::cos(angle)) * K * K;
-    }
-
-    // Convert from camera motion to standard point transformation convention
-    // Standard: p_curr = R @ p_prev + t (transforms points from prev to curr frame)
-    // Motion field gives camera motion (R_cam, t_cam) where:
-    //   - R_cam: camera rotation from frame 0 to frame 1
-    //   - t_cam: camera translation direction in frame 0 coords
-    // Point transformation: R = R_cam^T, t = -R_cam^T @ t_cam
-    Eigen::Matrix3d R = R_cam.transpose();
-    Eigen::Vector3d t = -(R_cam.transpose() * t_cam);
+    return pts;
+}
 
 
-    // ========== OPTIMIZED: Compute threshold using SAMPLING, then collect inliers from ALL ==========
-    int n_all = static_cast<int>(all_coords_normalized.size());
-    // Note: Use camera motion (omega, t_cam) for motion field residual computation
-    // omega and t_cam are already set from either translation-only or full estimation above
+// Per-point residual and angle error computation
+void MotionFieldEstimator::residual_at(int i, const CollectedPoints& pts,
+                                       const Eigen::Vector3d& omega,
+                                       const Eigen::Vector3d& t_cam,
+                                       double& out_residual, double& out_angle,
+                                       double& out_obs_mag) const {
+    double nx = pts.all_coords_normalized[i](0);  // normalized image coord
+    double ny = pts.all_coords_normalized[i](1);
+    double d_rel = pts.all_d_rels[i];
+    double nx2 = nx * nx, ny2 = ny * ny, nxy = nx * ny;
+
+    double t0 = t_cam(0), t1 = t_cam(1), t2 = t_cam(2);
     double omega0 = omega(0), omega1 = omega(1), omega2 = omega(2);
 
-    // Use t_cam directly for residual computation
-    // Note: For constrained depth_scale_mode == 2 (full estimation only), alpha was already
-    // incorporated into the estimation. For translation-only mode, alpha_est = 0.
-    double alpha_est = depth_offset;  // depth_offset = alpha for constrained mode, 0 otherwise
-    double t0 = t_cam(0), t1 = t_cam(1), t2 = t_cam(2);
+    // A(nx,ny) · t  (translation Jacobian)
+    double A_t_0 = -t0 + nx * t2;
+    double A_t_1 = -t1 + ny * t2;
 
-    // Lambda to compute residual and angle error for a single point (inline)
-    auto compute_residual_angle = [&](int i, double& out_residual, double& out_angle, double& out_obs_mag) {
-        double x = all_coords_normalized[i](0);
-        double y = all_coords_normalized[i](1);
-        double r = all_inv_depths_vec[i];
-        double x2 = x * x, y2 = y * y, xy = x * y;
+    // B(nx,ny) · ω + d_rel · A · t  (motion field prediction)
+    double pred_n0 = nxy * omega0 - (1.0 + nx2) * omega1 + ny * omega2 + d_rel * A_t_0;
+    double pred_n1 = (1.0 + ny2) * omega0 - nxy * omega1 - nx * omega2 + d_rel * A_t_1;
 
-        // Constrained mode: flow = B * omega + (r + alpha) * A * t
-        // A = [[-1, 0, x], [0, -1, y]]
-        double r_eff = (cfg_.depth_scale_mode == 2) ? (r + alpha_est) : r;
-        double A_t_0 = -t0 + x * t2;
-        double A_t_1 = -t1 + y * t2;
+    double obs_n0 = pts.all_flow_normalized[i](0);
+    double obs_n1 = pts.all_flow_normalized[i](1);
 
-        double pred_n0 = xy * omega0 - (1.0 + x2) * omega1 + y * omega2 + r_eff * A_t_0;
-        double pred_n1 = (1.0 + y2) * omega0 - xy * omega1 - x * omega2 + r_eff * A_t_1;
+    double err0 = pred_n0 - obs_n0;
+    double err1 = pred_n1 - obs_n1;
+    out_residual = std::sqrt(err0 * err0 + err1 * err1);
 
-        double obs_n0 = all_flow_normalized[i](0);
-        double obs_n1 = all_flow_normalized[i](1);
+    // Pixel space for angle
+    double pred_px0 = pred_n0 * fx_, pred_px1 = pred_n1 * fy_;
+    double obs_px0 = obs_n0 * fx_, obs_px1 = obs_n1 * fy_;
+    out_obs_mag = std::sqrt(obs_px0 * obs_px0 + obs_px1 * obs_px1);
 
-        double err0 = pred_n0 - obs_n0;
-        double err1 = pred_n1 - obs_n1;
-        out_residual = std::sqrt(err0 * err0 + err1 * err1);
+    if (out_obs_mag > cfg_.min_flow_px) {
+        double pred_mag = std::sqrt(pred_px0 * pred_px0 + pred_px1 * pred_px1) + kEpsDenom;
+        double dot = (pred_px0 * obs_px0 + pred_px1 * obs_px1) / (pred_mag * out_obs_mag);
+        dot = std::max(-1.0, std::min(1.0, dot));
+        out_angle = std::acos(dot) * 180.0 / M_PI;
+    } else {
+        out_angle = 0.0;
+    }
+}
 
-        // Pixel space for angle
-        double pred_px0 = pred_n0 * fx, pred_px1 = pred_n1 * fy;
-        double obs_px0 = obs_n0 * fx, obs_px1 = obs_n1 * fy;
-        out_obs_mag = std::sqrt(obs_px0 * obs_px0 + obs_px1 * obs_px1);
+// classify_inliers: Threshold computation + inlier collection from all points
+MotionFieldResult MotionFieldEstimator::classify_inliers(
+    const Eigen::Vector3d& omega,
+    const Eigen::Vector3d& t_cam,
+    const CollectedPoints& pts,
+    int H, int W) {
 
-        if (out_obs_mag > cfg_.min_flow_px) {
-            double pred_mag = std::sqrt(pred_px0 * pred_px0 + pred_px1 * pred_px1) + 1e-12;
-            double dot = (pred_px0 * obs_px0 + pred_px1 * obs_px1) / (pred_mag * out_obs_mag);
-            dot = std::max(-1.0, std::min(1.0, dot));
-            out_angle = std::acos(dot) * 180.0 / M_PI;
-        } else {
-            out_angle = 0.0;
-        }
-    };
+    int n_all = static_cast<int>(pts.all_coords_normalized.size());
 
-    // ===== Step 1: Sample points for threshold estimation =====
-    const int threshold_sample_size = std::min(50000, n_all);
+    // Step 1: Sample points for threshold estimation
+    constexpr int kClassifySampleSize = 50000;
+    const int threshold_sample_size = std::min(kClassifySampleSize, n_all);
     std::vector<int> sample_indices(n_all);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
 
     if (n_all > threshold_sample_size) {
-        std::mt19937 gen_sample(cfg_.seed == 0 ? 12345 : cfg_.seed + 100);
-        std::shuffle(sample_indices.begin(), sample_indices.end(), gen_sample);
-        sample_indices.resize(threshold_sample_size);
+        int step = n_all / threshold_sample_size;
+        sample_indices.clear();
+        for (int i = 0; i < n_all; i += step)
+            sample_indices.push_back(i);
     }
 
-    // Compute residuals and angle errors on sampled points only
+    // Compute residuals and angle errors on sampled points
     std::vector<double> sample_residuals(sample_indices.size());
     std::vector<double> sample_angle_errors;
     sample_angle_errors.reserve(sample_indices.size());
@@ -1474,118 +825,122 @@ MotionFieldResult MotionFieldEstimator::estimate(
     for (size_t s = 0; s < sample_indices.size(); ++s) {
         int i = sample_indices[s];
         double residual, angle, obs_mag;
-        compute_residual_angle(i, residual, angle, obs_mag);
+        residual_at(i, pts, omega, t_cam, residual, angle, obs_mag);
         sample_residuals[s] = residual;
         if (obs_mag > cfg_.min_flow_px) {
             sample_angle_errors.push_back(angle);
         }
     }
 
-    // Compute adaptive threshold from samples
-    int n_sample = static_cast<int>(sample_residuals.size());
-    std::nth_element(sample_residuals.begin(), sample_residuals.begin() + n_sample / 2, sample_residuals.end());
-    double median_res = sample_residuals[n_sample / 2];
+    // Compute adaptive thresholds (median + k*MAD)
+    auto thr = mad_thresholds(sample_residuals, sample_angle_errors, cfg_);
+    double residual_thresh = thr.residual;
+    double angle_thresh    = thr.angle;
 
-    std::vector<double> abs_dev(n_sample);
-    for (int s = 0; s < n_sample; ++s) {
-        abs_dev[s] = std::abs(sample_residuals[s] - median_res);
-    }
-    std::nth_element(abs_dev.begin(), abs_dev.begin() + n_sample / 2, abs_dev.end());
-    double mad = abs_dev[n_sample / 2] + 1e-8;
-    double thresh = median_res + cfg_.mad_scale * mad;
-
-    // Compute angle threshold from samples
-    double angle_thresh_final = 45.0;
-    if (sample_angle_errors.size() > 10) {
-        angle_thresh_final = compute_mad_threshold(sample_angle_errors, 3.0);
-        angle_thresh_final = std::max(15.0, std::min(angle_thresh_final, 60.0));
-    }
-
-    // Prepare result
+    // Step 2: Collect inliers from all valid pixels
     MotionFieldResult result;
-    result.R = R;
-    result.t = t;
-    result.omega = -omega;  // Negated to match R (R = exp(-omega_cam))
-    result.num_points_used = static_cast<int>(coords_normalized.size());  // Sampled points used for RANSAC
+    result.omega = omega;
+    double t_cam_norm = t_cam.norm();
+    // Normalize translation to unit direction; fall back to forward (+Z) if degenerate (near-zero)
+    result.T_hat = (t_cam_norm > 1e-8) ? t_cam / t_cam_norm : Eigen::Vector3d(0, 0, -1);
     result.inlier_mask = cv::Mat::zeros(H, W, CV_8U);
-    result.flow_refined = flow.clone();
-    result.depth_scale = depth_scale;
-    result.depth_offset = depth_offset;
 
-    // Collect inlier matches from ALL valid pixels (with angle gate)
-    // Flow fusion (Supplementary 2.5): outliers are replaced with motion-field prediction
+    // Pass 1: compute inlier flags in parallel
+    std::vector<uint8_t> is_inlier(n_all, 0);
     int num_inliers = 0;
-    double inlier_res_sum = 0.0;
 
-    // Reserve space for expected inliers (~80% typical)
-    result.u0.reserve(n_all * 8 / 10);
-    result.v0.reserve(n_all * 8 / 10);
-    result.u1.reserve(n_all * 8 / 10);
-    result.v1.reserve(n_all * 8 / 10);
-
-    // Lambda to compute motion-field predicted flow for a pixel
-    auto compute_predicted_flow = [&](int i, float& pred_u, float& pred_v) {
-        double x = all_coords_normalized[i](0);
-        double y = all_coords_normalized[i](1);
-        double r = all_inv_depths_vec[i];
-        double x2 = x * x, y2 = y * y, xy = x * y;
-
-        // Constrained mode: flow = B * omega + (r + alpha) * A * t
-        double r_eff = (cfg_.depth_scale_mode == 2) ? (r + alpha_est) : r;
-        double A_t_0 = -t0 + x * t2;
-        double A_t_1 = -t1 + y * t2;
-
-        double pred_n0 = xy * omega0 - (1.0 + x2) * omega1 + y * omega2 + r_eff * A_t_0;
-        double pred_n1 = (1.0 + y2) * omega0 - xy * omega1 - x * omega2 + r_eff * A_t_1;
-
-        // Convert to pixel flow
-        pred_u = static_cast<float>(pred_n0 * fx);
-        pred_v = static_cast<float>(pred_n1 * fy);
-    };
-
+    #pragma omp parallel for reduction(+:num_inliers) schedule(static)
     for (int i = 0; i < n_all; ++i) {
         double residual, angle, obs_mag;
-        compute_residual_angle(i, residual, angle, obs_mag);
+        residual_at(i, pts, omega, t_cam, residual, angle, obs_mag);
 
-        // Check residual threshold
-        bool res_ok = (residual <= thresh);
-
-        // Check angle gate for flows with sufficient magnitude
+        bool res_ok = (residual <= residual_thresh);
         bool angle_ok = true;
         if (obs_mag > cfg_.min_flow_px) {
-            angle_ok = (angle <= angle_thresh_final);
+            angle_ok = (angle <= angle_thresh);
         }
 
-        int px = static_cast<int>(all_pixel_x[i]);
-        int py = static_cast<int>(all_pixel_y[i]);
-
         if (res_ok && angle_ok) {
-            // Inlier: keep observed flow
-            result.u0.push_back(all_pixel_x[i]);
-            result.v0.push_back(all_pixel_y[i]);
-            result.u1.push_back(all_pixel_x[i] + all_flow_u[i]);
-            result.v1.push_back(all_pixel_y[i] + all_flow_v[i]);
+            is_inlier[i] = 1;
             num_inliers++;
-            inlier_res_sum += residual;
+        }
+    }
 
+    // Pass 2: inliers use actual flow, non-inliers use motion field predicted flow
+    result.matches.u0.reserve(n_all);
+    result.matches.v0.reserve(n_all);
+    result.matches.u1.reserve(n_all);
+    result.matches.v1.reserve(n_all);
+
+    for (int i = 0; i < n_all; ++i) {
+        float u0 = pts.all_matches.u0[i];
+        float v0 = pts.all_matches.v0[i];
+
+        if (is_inlier[i]) {
+            result.matches.u0.push_back(u0);
+            result.matches.v0.push_back(v0);
+            result.matches.u1.push_back(pts.all_matches.u1[i]);
+            result.matches.v1.push_back(pts.all_matches.v1[i]);
+
+            int px = static_cast<int>(u0);
+            int py = static_cast<int>(v0);
             if (px >= 0 && px < W && py >= 0 && py < H) {
-                result.inlier_mask.ptr<uint8_t>(py)[px] = 1;
+                result.inlier_mask.at<uint8_t>(py, px) = 1;
             }
         } else {
-            // Outlier: replace with motion-field prediction (Supplementary 2.5)
-            if (px >= 0 && px < W && py >= 0 && py < H) {
-                float pred_u, pred_v;
-                compute_predicted_flow(i, pred_u, pred_v);
-                result.flow_refined.ptr<cv::Vec2f>(py)[px] = cv::Vec2f(pred_u, pred_v);
-            }
+            double nx = pts.all_coords_normalized[i](0);
+            double ny = pts.all_coords_normalized[i](1);
+            double d_rel = pts.all_d_rels[i];
+            double nx2 = nx * nx, ny2 = ny * ny, nxy = nx * ny;
+
+            double t0 = t_cam(0), t1 = t_cam(1), t2 = t_cam(2);
+            double pred_n0 = nxy*omega(0) - (1.0+nx2)*omega(1) + ny*omega(2) + d_rel*(-t0 + nx*t2);
+            double pred_n1 = (1.0+ny2)*omega(0) - nxy*omega(1) - nx*omega(2) + d_rel*(-t1 + ny*t2);
+
+            float pred_u1 = u0 + static_cast<float>(pred_n0 * fx_);
+            float pred_v1 = v0 + static_cast<float>(pred_n1 * fy_);
+
+            result.matches.u0.push_back(u0);
+            result.matches.v0.push_back(v0);
+            result.matches.u1.push_back(pred_u1);
+            result.matches.v1.push_back(pred_v1);
         }
     }
 
     result.num_inliers = num_inliers;
-    result.mean_residual = num_inliers > 0 ?
-        static_cast<float>(inlier_res_sum / num_inliers) : 0.0f;
 
     return result;
 }
 
-} // namespace pr_depth
+MotionFieldResult MotionFieldEstimator::estimate(
+    const cv::Mat& flow,
+    const cv::Mat& d_rel,
+    const cv::Mat& mask,
+    const std::optional<Eigen::Vector3d>& known_omega) {
+
+    if (flow.type() != CV_32FC2) {
+        throw std::runtime_error("Flow must be CV_32FC2");
+    }
+    if (d_rel.type() != CV_32F) {
+        throw std::runtime_error("Inverse depth must be CV_32F");
+    }
+    if (flow.size() != d_rel.size()) {
+        throw std::runtime_error("Flow and inverse depth must have same size");
+    }
+
+    // Step 1: Collect and subsample valid points
+    CollectedPoints points = collect_points(flow, d_rel, mask);
+
+    // Step 2: RANSAC estimation
+    Eigen::VectorXd theta = motion::ransac(
+        points.flow_normalized, points.coords_normalized,
+        points.d_rels, points.flow_mags, points.cell_ids, points.max_cells,
+        cfg_, fx_, fy_, known_omega);
+    Eigen::Vector3d omega = theta.head<3>();
+    Eigen::Vector3d t_cam = theta.tail<3>();
+
+    // Step 3: Classify all points as inliers/outliers
+    return classify_inliers(omega, t_cam, points, flow.rows, flow.cols);
+}
+
+} // namespace ptc_depth

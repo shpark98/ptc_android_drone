@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "PRDepthAndroid"
+rootProject.name = "PTCDepthAndroid"
 include(":app")

@@ -9,7 +9,12 @@
 #include "qnn_include/QnnLog.h"
 #include "qnn_include/QnnWrapperUtils.hpp"
 #include "qnn_include/HTP/QnnHtpDevice.h"
+#include "qnn_include/HTP/QnnHtpGraph.h"
 #include "qnn_include/HTP/QnnHtpPerfInfrastructure.h"
+#include "qnn_include/QnnGraph.h"
+#include "qnn_include/QnnTypes.h"
+#include "qnn_include/System/QnnSystemContext.h"
+#include "qnn_include/System/QnnSystemInterface.h"
 
 class QnnDepthEstimator {
 public:
@@ -32,7 +37,8 @@ private:
 
     // Library handles
     void* m_backendLib = nullptr;
-    void* m_modelLib = nullptr;
+    void* m_modelLib = nullptr;       // libQnnModelDlc.so (DLC fallback path only)
+    void* m_systemLib = nullptr;      // libQnnSystem.so (context binary path)
 
     // QNN handles
     Qnn_LogHandle_t m_logHandle = nullptr;
@@ -43,9 +49,19 @@ private:
     // QNN interface
     QNN_INTERFACE_VER_TYPE m_qnnFn = QNN_INTERFACE_VER_TYPE_INIT;
 
-    // Graph info from composeGraphsFromDlc
+    // System interface (for context binary metadata)
+    QNN_SYSTEM_INTERFACE_VER_TYPE m_sysFn = QNN_SYSTEM_INTERFACE_VER_TYPE_INIT;
+    QnnSystemContext_Handle_t m_sysCtxHandle = nullptr;
+
+    // Graph info from composeGraphsFromDlc (DLC path)
     qnn_wrapper_api::GraphInfoPtr_t* m_graphsInfo = nullptr;
     uint32_t m_numGraphs = 0;
+
+    // Graph state for context binary path
+    bool m_isContextBinary = false;
+    Qnn_GraphHandle_t m_graphHandle = nullptr;        // single graph (retrieved from .bin)
+    std::vector<Qnn_Tensor_t> m_binInputTensors;       // owned copies from system context
+    std::vector<Qnn_Tensor_t> m_binOutputTensors;
 
     // Execution tensors with allocated buffers
     std::vector<Qnn_Tensor_t> m_execInputTensors;
@@ -76,6 +92,13 @@ private:
     static uint32_t getDataTypeSize(Qnn_DataType_t dataType);
     uint32_t calculateTensorSize(const Qnn_Tensor_t& tensor);
     bool setupExecutionTensors();
+    bool setupExecutionTensorsFromBinaryInfo(const Qnn_Tensor_t* inputs, uint32_t numInputs,
+                                              const Qnn_Tensor_t* outputs, uint32_t numOutputs);
     bool setupPerfConfig();
     QuantInfo extractQuantInfo(const Qnn_Tensor_t& tensor);
+
+    // Context binary loading path (fast — pre-compiled for target SoC).
+    // Returns false to indicate caller should fall back to DLC compose path.
+    bool initFromContextBinary(const std::string& nativeLibDir, const std::string& binPath);
+    bool initFromDlc(const std::string& nativeLibDir, const std::string& dlcPath);
 };

@@ -1,28 +1,24 @@
 cmake_minimum_required(VERSION 3.18.1)
-project(pr_depth_android)
+project(ptc_depth_android)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Android-specific flags
 if(ANDROID)
     message(STATUS "Building for Android ABI: ${ANDROID_ABI}")
-
-    # Find Android log library
     find_library(log-lib log)
 endif()
 
 # ============================================================
-# QNN Depth Estimator (GPU backend, no OpenCV/Eigen dependency)
+# qnn_depth_jni — preprocessing helpers for the ORT-QNN code path
+# (inference lives in ONNX Runtime / Java).
 # ============================================================
 add_library(qnn_depth_jni SHARED
-    qnn_depth_estimator.cpp
     qnn_jni_bridge.cpp
 )
 
 target_include_directories(qnn_depth_jni PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/qnn_include
 )
 
 target_link_libraries(qnn_depth_jni
@@ -30,62 +26,65 @@ target_link_libraries(qnn_depth_jni
     android
 )
 
-# Always optimize native code (even debug) — critical for YUV preprocessing loop
 target_compile_options(qnn_depth_jni PRIVATE -O3 -ffast-math)
 
-message(STATUS "QNN Depth Estimator build configured")
+message(STATUS "qnn_depth_jni build configured (preprocessing helpers only)")
 
 # ============================================================
-# PR-Depth core + JNI (OpenCV + Eigen)
+# PTC-Depth core + JNI (OpenCV + Eigen)
 # ============================================================
 set(OpenCV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../opencv-android-sdk/sdk/native/jni")
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video)
 message(STATUS "OpenCV found: ${OpenCV_VERSION} libs=${OpenCV_LIBS}")
 
 set(EIGEN3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/eigen3")
-set(PR_DEPTH_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cpp/include")
-set(PR_DEPTH_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cpp/src")
+set(PTC_DEPTH_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cpp/include")
+set(PTC_DEPTH_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cpp/src")
 
-# PR-Depth core library (optical flow, motion estimation, triangulation, fusion)
-add_library(pr_depth_core STATIC
-    ${PR_DEPTH_SRC_DIR}/optical_flow.cpp
-    ${PR_DEPTH_SRC_DIR}/motion_field.cpp
-    ${PR_DEPTH_SRC_DIR}/triangulation.cpp
-    ${PR_DEPTH_SRC_DIR}/depth_fusion.cpp
-    ${PR_DEPTH_SRC_DIR}/depth_refinement.cpp
+# PTC-Depth core library
+add_library(ptc_depth_core STATIC
+    ${PTC_DEPTH_SRC_DIR}/motion_field.cpp
+    ${PTC_DEPTH_SRC_DIR}/triangulation.cpp
+    ${PTC_DEPTH_SRC_DIR}/scale_estimation.cpp
+    ${PTC_DEPTH_SRC_DIR}/depth_warp.cpp
+    ${PTC_DEPTH_SRC_DIR}/bayesian_fusion.cpp
+    ${PTC_DEPTH_SRC_DIR}/ptc_depth.cpp
 )
 
-target_include_directories(pr_depth_core PUBLIC
-    ${PR_DEPTH_INCLUDE_DIR}
+target_include_directories(ptc_depth_core PUBLIC
+    ${PTC_DEPTH_INCLUDE_DIR}
     ${EIGEN3_DIR}
     ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(pr_depth_core
+target_link_libraries(ptc_depth_core
     ${OpenCV_LIBS}
     ${log-lib}
 )
 
-target_compile_options(pr_depth_core PRIVATE -O3 -ffast-math)
+# OpenMP is available in NDK r21+ via libomp. Adding -fopenmp enables #pragma omp
+# directives in the PTC-Depth core (motion field RANSAC, fusion, scale solver).
+target_compile_options(ptc_depth_core PRIVATE -O3 -ffast-math -fopenmp -static-openmp)
+target_link_options(ptc_depth_core PUBLIC -fopenmp -static-openmp)
 
-# PR-Depth JNI bridge
-add_library(pr_depth_jni SHARED
+# PTC-Depth JNI bridge
+add_library(ptc_depth_jni SHARED
     jni_bridge.cpp
 )
 
-target_include_directories(pr_depth_jni PRIVATE
-    ${PR_DEPTH_INCLUDE_DIR}
+target_include_directories(ptc_depth_jni PRIVATE
+    ${PTC_DEPTH_INCLUDE_DIR}
     ${EIGEN3_DIR}
     ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(pr_depth_jni
-    pr_depth_core
+target_link_libraries(ptc_depth_jni
+    ptc_depth_core
     ${OpenCV_LIBS}
     ${log-lib}
     android
 )
 
-target_compile_options(pr_depth_jni PRIVATE -O3 -ffast-math)
+target_compile_options(ptc_depth_jni PRIVATE -O3 -ffast-math)
 
-message(STATUS "PR-Depth build configured with OpenCV ${OpenCV_VERSION}")
+message(STATUS "PTC-Depth build configured with OpenCV ${OpenCV_VERSION}")
