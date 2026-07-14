@@ -490,8 +490,11 @@ ScaleFusionResult PTCDepth::refine(
         auto tD = Clk::now();
         t_triwarp_ms += std::chrono::duration_cast<std::chrono::milliseconds>(tD - tC).count();
 
-        filter_outliers(tri_result.z_obs, d_rel_f, H, W);
-        cv::Mat z_obs_filtered = tri_result.z_obs;  // filtered for fusion
+        // EXPERIMENT: skip filter_outliers — overlaps with solve_metric_from_rel's
+        // own RANSAC inlier detection downstream. ~16ms saved per frame. Depth
+        // quality test pending.
+        // filter_outliers(tri_result.z_obs, d_rel_f, H, W);
+        cv::Mat z_obs_filtered = tri_result.z_obs;  // not filtered
 
         auto tE = Clk::now();
         t_filter_ms += std::chrono::duration_cast<std::chrono::milliseconds>(tE - tD).count();
