@@ -1,4 +1,4 @@
-# PR-Depth (PTC-Depth) — CLAUDE.md
+# PTC-Depth — CLAUDE.md
 
 Real-time metric depth estimation on mobile using monocular depth + multi-frame
 fusion. This repo is an **Android-app-focused handoff**: the Python ML pipeline,

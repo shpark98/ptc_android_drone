@@ -1,4 +1,4 @@
-# Building PR-Depth C++ Library
+# Building PTC-Depth C++ Library
 
 ## Prerequisites
 
@@ -30,8 +30,8 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
 # Verify
-ls -lh libpr_depth_core.so
-ls -lh pr_depth_cpp*.so
+ls -lh libptc_depth_core.a
+ls -lh ptc_depth_cpp*.so
 ```
 
 ## Test the Build
@@ -41,10 +41,10 @@ ls -lh pr_depth_cpp*.so
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 # Test import
-python3 -c "import pr_depth_cpp; print(pr_depth_cpp.__doc__)"
+python3 -c "import ptc_depth_cpp; print(ptc_depth_cpp.__doc__)"
 
 # Should print:
-# PR-Depth C++ core library - minimal bindings for parity testing
+# PTC-Depth C++ core library - minimal bindings for parity testing
 ```
 
 ## Run Parity Test

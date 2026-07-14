@@ -1,4 +1,4 @@
-# Build & Install Guide — PR-Depth Android
+# Build & Install Guide — PTC-Depth Android
 
 Complete instructions to build the APK, provision dependencies, and install on a
 device. Verified on **Samsung SM-S948N (SM8850, Snapdragon 8 Elite Gen 5,

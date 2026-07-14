@@ -25,8 +25,9 @@ Full build/install/troubleshooting: [`android/BUILD.md`](android/BUILD.md).
 | C++ pipeline (required, shared) | `cpp/src/*.cpp`, `cpp/include/ptc_depth/` |
 | Native build config | `android/app/src/main/cpp/CMakeLists.txt`, `android/app/build.gradle.kts` |
 
-Note the package/dir name is `com.ptcdepth.android` (the project is referred to
-as both "PR-Depth" and "PTC-Depth").
+The project is **PTC-Depth** (package `com.ptcdepth.android`, C++ core
+`PTCDepth`). The repo directory is `pr_depth_android` and a few old code comments
+say "pr_depth" — legacy only; the name is PTC-Depth.
 
 ## Build / run / verify
 

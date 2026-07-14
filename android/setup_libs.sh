@@ -1,12 +1,12 @@
 #!/bin/bash
-# Setup external libraries for PR-Depth Android
+# Setup external libraries for PTC-Depth Android
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIBS_DIR="$SCRIPT_DIR/app/libs"
 
-echo "=== PR-Depth Android Libraries Setup ==="
+echo "=== PTC-Depth Android Libraries Setup ==="
 
 # Create libs directory
 mkdir -p "$LIBS_DIR"

@@ -1,4 +1,4 @@
-# PR-Depth (a.k.a. PTC-Depth) — Android
+# PTC-Depth — Android
 
 Real-time **metric depth estimation on mobile**: monocular depth (Depth Anything V2)
 refined with multi-frame geometry (optical flow → RANSAC → triangulation →
@@ -83,6 +83,29 @@ adb install -r --no-streaming app/build/outputs/apk/debug/app-debug.apk
 
 No `setup_libs.sh` or separate downloads required. (`android/setup_libs.sh` is
 kept only for re-fetching the full multi-ABI OpenCV SDK if ever needed.)
+
+### What's committed (so `git clone` is enough)
+
+Everything the APK build needs is in git:
+
+- Source: `android/` + `cpp/`
+- OpenCV 4.8.0, trimmed to arm64-v8a (`android/opencv-android-sdk/`)
+- Eigen 3.4.0 (`android/app/libs/eigen3/`)
+- QNN HTP runtime libs V69/V73/V79/V81 (`android/app/libs/arm64-v8a/`)
+- Model files: `depth_anything_v2.onnx` + `.data` (QNN) and `depth_anything.onnx`
+  (CPU fallback) in `android/app/src/main/assets/`
+
+The repo is therefore ~500 MB. Every file is under GitHub's 100 MB limit, so
+**no Git LFS is needed** — a plain `git clone` pulls it all. Not included: the
+unused `snpe-release.aar`, and the Python ML pipeline / weights / captures
+(git-ignored `archive/`).
+
+Install on a device (large APK — streaming can hang on some Samsung phones):
+
+```bash
+adb install -r --no-streaming app/build/outputs/apk/debug/app-debug.apk
+# if adb goes unresponsive: adb kill-server && adb start-server
+```
 
 Target/verified device: **Samsung SM-S948N (Snapdragon 8 Elite Gen 5 / SM8850,
 Hexagon V81, Android 16)**. Also known to run on Galaxy S25 (SM8750/V79) and
