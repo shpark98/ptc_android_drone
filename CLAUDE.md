@@ -79,6 +79,19 @@ shows an "ELF alignment check failed" warning. Hexagon skels don't count. Kept
 via: NDK r27c, `-Wl,-z,max-page-size=16384` in `cpp/CMakeLists.txt`, ARCore 1.48,
 and removing the unused CameraX dependency. Do not downgrade the NDK or ARCore.
 
+## Extending: external scale / sensor input
+The pipeline's metric scale ("이동거리" / travel distance) comes from ARCore VIO as
+a single scalar `baseline` (metres): `ARCoreManager.computeRelativePose()` (baseline
+= ‖relative translation‖) → `MainActivity.processFrame` (`relPose.baseline`) →
+`DepthRefinementManager.processFrameSync(..., baseline)` → JNI → C++
+`pipeline.refine(..., baseline, ...)`. Convention: `P_curr = R·P_prev + baseline·t`
+(unit `t`, `baseline` = its metre scale).
+- **Injection point**: `MainActivity.kt`, grep `SCALE INJECTION POINT`. Replace
+  `metricBaseline` with an external sensor's distance for the same prev→curr interval.
+- Still needed: a sensor data source (none exists yet — only ARCore feeds the app),
+  timestamp sync to the frame pair, metres, and — only if replacing direction too —
+  the CV convention + portrait `C_rot`. Scalar-only swap avoids the convention work.
+
 ## iOS Porting Notes (reference, not in this handoff)
 - Core ML: `apple/coreml-depth-anything-v2-small` (HF). Float16: 49.8MB, input 518x396. ~60-80ms on A12Z.
 - ARKit: `ARFrame.camera.transform` ≈ ARCore pose; `.intrinsics` ≈ `imageIntrinsics`;

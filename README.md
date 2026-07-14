@@ -10,9 +10,29 @@ Python ML pipeline (training, evaluation, model conversion) and large data
 (model weights, phone captures) have been moved to [`archive/`](archive/README.md),
 which is git-ignored and **not** part of this handoff.
 
-> **New here?** Read [`android/BUILD.md`](android/BUILD.md) to build and install,
-> and [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) if you are an AI coding
-> agent (Codex / Claude).
+## 🤖 Start here (AI agents & new developers)
+
+**If you are an AI coding agent, read your guide first — it has the file map,
+coordinate conventions, build/run/verify commands, and known gotchas:**
+
+- **Codex** → [`AGENTS.md`](AGENTS.md)
+- **Claude** → [`CLAUDE.md`](CLAUDE.md)
+- Humans building the app → [`android/BUILD.md`](android/BUILD.md)
+
+Then: build with `cd android && ./gradlew :app:assembleDebug` (deps are already
+in the repo — see [Quick start](#quick-start)), and verify a change actually runs
+with `adb logcat` (a healthy start logs `Detected SoC:` + `ARCore session
+initialized`).
+
+### 👉 Current follow-up task (for the receiving team/agent)
+
+Make the pipeline's **metric scale (travel distance) come from an external
+sensor** instead of ARCore VIO. The whole scale path is one scalar `baseline`
+(metres); the injection seam is marked in code — grep **`SCALE INJECTION POINT`**
+in `android/app/src/main/java/com/ptcdepth/android/MainActivity.kt`. Full
+explanation + caveats (data source, time sync, units, coordinate convention) are
+in [`AGENTS.md`](AGENTS.md) / [`CLAUDE.md`](CLAUDE.md) → *"External scale / sensor
+input"*.
 
 ## What the app does
 
@@ -70,8 +90,22 @@ This repo is **self-contained**: all native dependencies (OpenCV arm64-v8a,
 Eigen, QNN HTP libs) and the model files are committed, so a plain `git clone`
 is all you need besides the Android SDK/NDK.
 
+**This is a private repository** — cloning needs access + auth first:
+
+1. The owner grants you access: GitHub repo → *Settings → Collaborators → Add
+   people* (or accept an org invite). Without this, clone fails with
+   `Repository not found`.
+2. Then clone with **either**:
+   - **SSH** — add your public key to GitHub (*Settings → SSH and GPG keys*), then
+     `git clone git@github.com:leezy211/depth_android.git`
+   - **HTTPS + token** — create a Personal Access Token (*Settings → Developer
+     settings → Personal access tokens*, repo scope / read access), then
+     `git clone https://github.com/leezy211/depth_android.git` and use your GitHub
+     username + the **token as the password** (not your account password).
+
 ```bash
-git clone git@github.com:leezy211/depth_android.git
+# after access + auth is set up:
+git clone git@github.com:leezy211/depth_android.git   # or the https URL
 cd depth_android/android
 # One-time: Android SDK + NDK r27c + cmake;3.22.1  (see android/BUILD.md §1)
 echo "sdk.dir=$HOME/Android/Sdk" > local.properties

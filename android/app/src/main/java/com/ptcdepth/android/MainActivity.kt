@@ -1125,13 +1125,24 @@ class MainActivity : AppCompatActivity() {
                         val gtR = if (useGTPose) relPose.R else null
                         val gtT = if (useGTPose) relPose.t else null
 
+                        // === SCALE INJECTION POINT (metric baseline / travel distance) ===
+                        // `relPose.baseline` is the VIO travel distance between the
+                        // previous and current frame (‖ARCore relative translation‖, in
+                        // metres). It is the metric scale the pipeline applies to depth.
+                        // To drive scale from an EXTERNAL sensor instead of ARCore VIO,
+                        // replace `relPose.baseline` below with your sensor's distance for
+                        // the SAME prev→curr interval (metres). Rotation/direction stay
+                        // from ARCore unless you also override gtR/gtT. See AGENTS.md /
+                        // CLAUDE.md "External scale / sensor input".
+                        val metricBaseline = relPose.baseline
+
                         depthResult = mgr.processFrameSync(
                             yData, uData, vData,
                             localCamW, localCamH,
                             localYRowStride, localUvRowStride, localUvPixelStride,
                             localRotDeg,
                             output, modelW, modelH,
-                            relPose.baseline,
+                            metricBaseline,
                             gtR, gtT
                         )
                     }

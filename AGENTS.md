@@ -70,6 +70,39 @@ with `R = R_cam^T` (`motion_field.cpp`). ARCore→pipeline conversion:
 - **adb**: large-APK streaming install can hang → `--no-streaming`; if `adb shell`
   goes unresponsive, `adb kill-server && adb start-server`.
 
+## Extending: external scale / sensor input
+
+The pipeline's **metric scale** ("이동거리" / travel distance) currently comes from
+ARCore VIO. It flows as a single scalar `baseline` (metres):
+
+```
+ARCoreManager.computeRelativePose()   baseline = ‖relative translation‖   (VIO)
+  → MainActivity.processFrame          relPose.baseline
+  → DepthRefinementManager.processFrameSync(..., baseline)
+  → JNI nativeProcessFrameYUV(..., baseline)   (jni_bridge.cpp)
+  → C++ pipeline.refine(gray, invDepth, baseline, ext_R, ext_t, ...)
+```
+
+Convention: `P_curr = R·P_prev + baseline·t`, where `t` is a unit direction and
+`baseline` is its metre-scale magnitude (`jni_bridge.cpp` does `ext_t = t/‖t‖ *
+baseline`).
+
+**To drive scale from an external sensor instead of VIO:** the single injection
+point is `MainActivity.kt` — grep `SCALE INJECTION POINT`. Replace the
+`metricBaseline` value with your sensor's travel distance for the same prev→curr
+frame interval. That's the only change needed for scale.
+
+What you must still provide/handle (this is the real work — the seam itself is trivial):
+- **A data source.** Today only ARCore feeds the app; add an input path for your
+  sensor (BLE/serial/USB/socket/IMU). No such interface exists yet.
+- **Time sync.** `baseline` must be the distance over the *same* prev→curr frame
+  interval the depth pair spans (align by timestamp).
+- **Units.** Metres (ARCore world units are metres).
+- **Direction too?** If you also replace the translation *direction*, honor the CV
+  convention (`C = diag(1,-1,-1)`) and the portrait rotation `C_rot` that
+  `ARCoreManager`/`jni_bridge.cpp` apply. Replacing only the scalar magnitude
+  avoids all of that.
+
 ## Conventions
 
 - Match surrounding code style; keep changes minimal and scoped.
