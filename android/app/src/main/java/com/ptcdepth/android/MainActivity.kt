@@ -19,6 +19,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 import java.util.concurrent.Executors
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -123,6 +124,14 @@ class MainActivity : AppCompatActivity() {
     private var camW = 0
     private var camH = 0
     private var rotDeg = 90
+
+    // One-shot request: next frame, write a colored PLY of the current depth.
+    // Captured inside processFrame so depth + YUV + intrinsics are consistent.
+    @Volatile private var plySaveRequested = false
+    // Continuous capture: every refined frame (rate-limited) is written as a PLY.
+    @Volatile private var plyContinuousRecording = false
+    private var lastPlySaveMs = 0L
+    private val plyMinIntervalMs = 100L  // skip frames closer than this (~10 Hz max)
 
     // Pre-allocated buffers
     private var normalizedBuf: FloatArray? = null
@@ -361,6 +370,28 @@ class MainActivity : AppCompatActivity() {
         // Browse recordings (HUD button)
         findViewById<TextView>(R.id.btn_browse_recordings_hud).setOnClickListener {
             showRecordingBrowser()
+        }
+
+        // Save current depth as colored PLY. Toggle: tap to start continuous
+        // capture, tap again to stop. Long-press still does a one-shot snapshot.
+        val btnSavePly = findViewById<TextView>(R.id.btn_save_ply)
+        btnSavePly.setOnClickListener {
+            plyContinuousRecording = !plyContinuousRecording
+            Log.i(TAG, "PLY button tap: plyContinuousRecording=$plyContinuousRecording")
+            if (plyContinuousRecording) {
+                lastPlySaveMs = 0L
+                btnSavePly.setTextColor(0xFFFF4444.toInt())
+                Toast.makeText(this, "PLY 연속 저장 시작", Toast.LENGTH_SHORT).show()
+            } else {
+                btnSavePly.setTextColor(0xFFFFCC44.toInt())
+                Toast.makeText(this, "PLY 연속 저장 중지", Toast.LENGTH_SHORT).show()
+            }
+        }
+        btnSavePly.setOnLongClickListener {
+            plySaveRequested = true
+            Log.i(TAG, "PLY button long-press: one-shot save requested")
+            Toast.makeText(this, "PLY 한 장 저장", Toast.LENGTH_SHORT).show()
+            true
         }
 
         // Playback controls
@@ -1117,6 +1148,26 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
 
+                    // PLY save (snapshot taken on depth thread for consistency).
+                    // One-shot via long-press; continuous mode rate-limited to
+                    // plyMinIntervalMs so I/O doesn't drown the depth thread.
+                    val nowMs = System.currentTimeMillis()
+                    val continuousDue = plyContinuousRecording &&
+                        (nowMs - lastPlySaveMs >= plyMinIntervalMs)
+                    if (plySaveRequested || continuousDue) {
+                        val oneShot = plySaveRequested
+                        plySaveRequested = false
+                        lastPlySaveMs = nowMs
+                        savePLYSnapshot(
+                            depthResult?.refinedDepth, output, modelW, modelH,
+                            yData, uData, vData,
+                            localCamW, localCamH,
+                            localYRowStride, localUvRowStride, localUvPixelStride,
+                            localRotDeg,
+                            showToast = oneShot,  // silent during continuous
+                        )
+                    }
+
                     // Step 3: Pre-compute 3D RGB pixels on depth thread (avoid blocking UI thread)
                     val rgbPixelsFor3D: IntArray? = if (viewMode == VIEW_3D && useRGBColor) {
                         yuvToARGBRotated(yData, uData, vData, localCamW, localCamH,
@@ -1437,6 +1488,61 @@ class MainActivity : AppCompatActivity() {
             textViewFPS.text = "FPS: %.1f".format(fpsEma)
         }
         lastFrameTime = currentTime
+    }
+
+    /**
+     * Snapshot current depth + YUV + intrinsics as a raw .ptcf blob.
+     * No projection / no YUV→RGB on device — that runs offline on PC (ptcf_to_ply.py),
+     * so the depth-thread save cost is just memory + file I/O (~10ms).
+     */
+    private fun savePLYSnapshot(
+        refinedDepth: FloatArray?, monoDepth: FloatArray, modelW: Int, modelH: Int,
+        yData: ByteArray, uData: ByteArray, vData: ByteArray,
+        imgW: Int, imgH: Int,
+        yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
+        rotationDegrees: Int,
+        showToast: Boolean = true,
+    ) {
+        val ri = modelIntrinsics
+        val isRotated = (rotationDegrees == 90 || rotationDegrees == 270)
+        val outW = ri?.width ?: (if (isRotated) imgH else imgW)
+        val outH = ri?.height ?: (if (isRotated) imgW else imgH)
+        val depth = refinedDepth
+            ?: if (modelW == outW && modelH == outH) monoDepth
+               else resizeFloatBilinear(monoDepth, modelW, modelH, outW, outH)
+        val fx = ri?.fx ?: 400f
+        val fy = ri?.fy ?: 400f
+        val cx = ri?.cx ?: (outW / 2f)
+        val cy = ri?.cy ?: (outH / 2f)
+
+        val dir = File(getExternalFilesDir(null), "captures")
+        val outFile = File(dir, "cap_${System.currentTimeMillis()}.ptcf")
+        try {
+            val bytes = RawCaptureWriter.save(
+                depth, outW, outH,
+                yData, uData, vData,
+                imgW, imgH, yRowStride, uvRowStride, uvPixelStride,
+                rotationDegrees,
+                fx, fy, cx, cy,
+                outFile,
+            )
+            if (showToast) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "저장됨: ${outFile.name} (${bytes / 1024} KB)",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "raw capture save failed", e)
+            if (showToast) {
+                runOnUiThread {
+                    Toast.makeText(this, "저장 실패: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
     }
 
     private var rgbBuf: IntArray? = null

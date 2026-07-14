@@ -349,6 +349,18 @@
             android:background="@drawable/bg_gear_button" />
 
         <TextView
+            android:id="@+id/btn_save_ply"
+            android:layout_width="36dp"
+            android:layout_height="28dp"
+            android:layout_marginStart="4dp"
+            android:gravity="center"
+            android:text="PLY"
+            android:textSize="9sp"
+            android:textStyle="bold"
+            android:textColor="#FFCC44"
+            android:background="@drawable/bg_gear_button" />
+
+        <TextView
             android:id="@+id/btn_browse_recordings_hud"
             android:layout_width="28dp"
             android:layout_height="28dp"
