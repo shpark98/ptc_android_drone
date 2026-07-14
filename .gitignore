@@ -1,21 +1,27 @@
+# ---------------------------------------------------------------------------
+# Archived / non-Android material (Python ML pipeline, model weights, phone
+# captures, model-conversion scripts). Kept locally under archive/ but excluded
+# from the Android-app handoff. See archive/README.md.
+# ---------------------------------------------------------------------------
+/archive/
+
 # Build artifacts
 /android/app/build/
 /android/app/.cxx/
 /android/.gradle/
 /android/build/
-/android/gradle-8.2/
-/android/gradle-8.2-bin.zip
 /cpp/build/
 
-# Model weights (too large for git)
-/weights/
-
-# Model assets (too large for git, download separately)
+# Model assets — large binaries, provided/downloaded separately (see
+# android/BUILD.md). The app needs: depth_anything_v2.onnx + .data (QNN) and
+# depth_anything.onnx (CPU fallback).
 /android/app/src/main/assets/*.dlc
 /android/app/src/main/assets/*.onnx
+/android/app/src/main/assets/*.data
 /android/app/src/main/assets/*.tflite
+/android/app/src/main/assets/*.bin
 
-# Gradle distribution (download automatically)
+# Gradle distribution (the wrapper downloads it automatically)
 /android/gradle/wrapper/gradle-*.zip*
 
 # Python
@@ -43,22 +49,16 @@ Thumbs.db
 *.o
 *.a
 
-# Native libraries (pre-built QNN libs bundled in jniLibs)
+# Bundled native dependencies — obtained via android/setup_libs.sh / QAIRT SDK
+# (see android/BUILD.md), too large for git
 /android/app/src/main/jniLibs/
-
-# Bundled libraries (download separately)
 /android/app/libs/eigen3/
 /android/app/libs/arm64-v8a/
 /android/app/libs/*.aar
 /android/app/libs/*.jar
 
-# OpenCV SDK (large, download separately)
+# OpenCV Android SDK (large, download via android/setup_libs.sh)
 /android/opencv-android-sdk/
 
 # Compile logs
 compile_*.txt
-
-# Data files (too large for git)
-/dataloader/gt_poses/
-/dataloader/.cache/
-/tests/data/
