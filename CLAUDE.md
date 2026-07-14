@@ -87,12 +87,14 @@ and removing the unused CameraX dependency. Do not downgrade the NDK or ARCore.
 - Reuse C++ via Objective-C++ (replace JNI); OpenCV via CocoaPods/SPM; Eigen header-only.
 - UIKit for Metal/AR; point cloud OpenGL ES → Metal; depth viz custom UIView.
 
-## Dependencies (not in git — see android/BUILD.md §2)
-- **QNN SDK**: QAIRT 2.42 (`/home/arrl/qairt-2.42/qairt/2.42.0.251225/`) — source of QNN libs
-- **OpenCV Android SDK 4.8.0** + **Eigen 3.4.0**: via `android/setup_libs.sh`
-- **Model assets**: `depth_anything_v2.onnx`+`.data` (QNN), `depth_anything.onnx` (CPU) in
-  `android/app/src/main/assets/` — provided separately (~190 MB)
-- **ARCore SDK**: Gradle dependency
+## Dependencies — committed for a self-contained `git clone` (see android/BUILD.md §2)
+- **OpenCV 4.8.0** (trimmed to arm64-v8a) in `android/opencv-android-sdk/`
+- **Eigen 3.4.0** in `android/app/libs/eigen3/`
+- **QNN HTP libs** in `android/app/libs/arm64-v8a/` (from QAIRT 2.42)
+- **Model files** in `android/app/src/main/assets/`: `depth_anything_v2.onnx`+`.data` (QNN),
+  `depth_anything.onnx` (CPU fallback)
+- **ARCore + ONNX Runtime QNN**: Gradle dependencies
+- Only the Android SDK/NDK (r27c, cmake 3.22.1) must be installed by the builder.
 
 ## Archived (git-ignored, `archive/`)
 Python ML training/eval/conversion (`python-ml/`), model weights (`weights/`, 6 GB),

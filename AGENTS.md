@@ -38,8 +38,8 @@ adb shell am start -n com.ptcdepth.android/.MainActivity                # launch
 adb logcat | grep -E "DepthEstimatorQNN|ARCoreManager|FATAL"           # verify
 ```
 
-- Requires deps not in git (OpenCV, Eigen, QNN libs, model assets) — see
-  `android/BUILD.md` §2. `cpp/` is required (CMake references it).
+- Self-contained: OpenCV (arm64-v8a), Eigen, QNN libs, and model files are all
+  committed — just need the Android SDK/NDK. `cpp/` is required (CMake references it).
 - Do a **clean** build (`:app:clean :app:assembleDebug`) after asset/native
   changes; incremental packaging can bloat the APK with orphaned bytes.
 - A healthy QNN start logs `Detected SoC: '<model>' → soc_model=.., htp_arch=..`

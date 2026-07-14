@@ -38,47 +38,33 @@ Create `android/local.properties` (git-ignored):
 sdk.dir=/home/<you>/Android/Sdk
 ```
 
-## 2. Native dependencies (not in git)
+## 2. Native dependencies — committed (self-contained clone)
 
-### 2a. OpenCV + Eigen — automated
-```bash
-cd android
-./setup_libs.sh      # downloads OpenCV 4.8.0 Android SDK + Eigen 3.4.0
-```
-Note: the app's `CMakeLists.txt` expects the OpenCV SDK at
-`android/opencv-android-sdk/`. `setup_libs.sh` currently unpacks into
-`app/libs/opencv-android-sdk`; if the build can't find OpenCV, symlink or move it:
-`ln -s app/libs/opencv-android-sdk android/opencv-android-sdk`. Eigen is expected
-at `android/app/libs/eigen3/`.
+Everything the build needs is **already in the repo** — no downloads, no
+`setup_libs.sh`. A plain `git clone` gives you:
 
-### 2b. QNN / QAIRT runtime libs — manual
-The app bundles QNN HTP runtime libraries in `android/app/app/libs/arm64-v8a/`
-(git-ignored). They come from the **Qualcomm QAIRT 2.42 SDK**. Required files:
+| Dependency | Location (in git) | Notes |
+|------------|-------------------|-------|
+| OpenCV 4.8.0 (arm64-v8a only) | `android/opencv-android-sdk/` | trimmed to arm64-v8a + JNI headers to keep the repo small (the app builds arm64-v8a only) |
+| Eigen 3.4.0 (header-only) | `android/app/libs/eigen3/` | |
+| QNN HTP runtime libs | `android/app/libs/arm64-v8a/` | from QAIRT 2.42 SDK; see below |
+| Model files | `android/app/src/main/assets/` | `depth_anything_v2.onnx`+`.data` (QNN), `depth_anything.onnx` (CPU fallback) |
+| ONNX Runtime QNN EP | Gradle | `com.microsoft.onnxruntime:onnxruntime-android-qnn:1.24.3` |
 
-- `libQnnHtp.so`, `libQnnHtpPrepare.so`, `libQnnSystem.so`, `libQnnModelDlc.so`
-- Per-arch stubs + skels: `libQnnHtpV{69,73,79,81}Stub.so` and
-  `libQnnHtpV{69,73,79,81}Skel.so`
-  - Stubs are AArch64; skels are **Hexagon** ELFs that run on the DSP.
-  - V81 is required for SM8850; V79 for S25; V69 for S22.
-  - Skels live under `<QAIRT>/lib/hexagon-vNN/unsigned/`, other libs under
-    `<QAIRT>/lib/aarch64-android/`.
-- `libc++_shared.so` comes from the NDK (r27c → 16 KB-aligned).
+Model files: `.onnx` + `.data` must sit next to each other. The `.data` is the
+external weights referenced by `depth_anything_v2.onnx`.
 
-ONNX Runtime with the QNN EP is pulled via Gradle
-(`com.microsoft.onnxruntime:onnxruntime-android-qnn:1.24.3`) — no manual step.
-
-### 2c. Model assets — provided separately
-Place these in `android/app/src/main/assets/` (git-ignored, ~190 MB total):
-
-| File | Size | Used by |
-|------|------|---------|
-| `depth_anything_v2.onnx` | 1.3 MB | QNN path (graph) |
-| `depth_anything_v2.data`  | 95 MB  | QNN path (external weights, referenced by the .onnx) |
-| `depth_anything.onnx`     | 95 MB  | CPU fallback (`DepthEstimator`) |
-
-`.onnx` + `.data` must sit next to each other. These are outputs of the model
-conversion scripts now in `archive/scripts/` + `archive/python-ml/model_conversion/`.
-Obtain them from the previous owner or regenerate from the archive.
+### Where these came from (only needed to *refresh/extend*, not to build)
+- **OpenCV + Eigen**: `android/setup_libs.sh` downloads the full multi-ABI OpenCV
+  4.8.0 SDK + Eigen 3.4.0. The committed OpenCV is that SDK trimmed to
+  `sdk/native/{jni,libs/arm64-v8a,3rdparty/libs/arm64-v8a,staticlibs/arm64-v8a}`.
+- **QNN libs** (from the Qualcomm QAIRT 2.42 SDK):
+  `libQnnHtp.so`, `libQnnHtpPrepare.so`, `libQnnSystem.so`, `libQnnModelDlc.so`,
+  and per-arch `libQnnHtpV{69,73,79,81}{Stub,Skel}.so`. Stubs are AArch64; skels
+  are **Hexagon** ELFs (run on the DSP; `<QAIRT>/lib/hexagon-vNN/unsigned/`).
+  Add a new arch's `Stub`+`Skel` here to support a new chip.
+- **Model files**: outputs of the conversion scripts in `archive/scripts/` +
+  `archive/python-ml/model_conversion/`.
 
 ## 3. Build
 

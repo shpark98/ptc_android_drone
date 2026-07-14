@@ -66,15 +66,23 @@ archive/           git-ignored: Python ML pipeline, weights, captures (see its R
 
 ## Quick start
 
+This repo is **self-contained**: all native dependencies (OpenCV arm64-v8a,
+Eigen, QNN HTP libs) and the model files are committed, so a plain `git clone`
+is all you need besides the Android SDK/NDK.
+
 ```bash
-# 1. Android SDK + NDK r27c + cmake (see android/BUILD.md for details)
-# 2. Native deps:
-cd android && ./setup_libs.sh          # OpenCV + Eigen
-#    QNN libs + model assets: see android/BUILD.md (provided separately)
-# 3. Build + install (16 KB-page devices need --no-streaming for the large APK):
+git clone git@github.com:leezy211/depth_android.git
+cd depth_android/android
+# One-time: Android SDK + NDK r27c + cmake;3.22.1  (see android/BUILD.md §1)
+echo "sdk.dir=$HOME/Android/Sdk" > local.properties
+
 ./gradlew :app:assembleDebug
+# 16 KB-page devices need --no-streaming for the large (~272 MB) APK:
 adb install -r --no-streaming app/build/outputs/apk/debug/app-debug.apk
 ```
+
+No `setup_libs.sh` or separate downloads required. (`android/setup_libs.sh` is
+kept only for re-fetching the full multi-ABI OpenCV SDK if ever needed.)
 
 Target/verified device: **Samsung SM-S948N (Snapdragon 8 Elite Gen 5 / SM8850,
 Hexagon V81, Android 16)**. Also known to run on Galaxy S25 (SM8750/V79) and
