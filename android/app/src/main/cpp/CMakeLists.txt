@@ -9,6 +9,13 @@ if(ANDROID)
     find_library(log-lib log)
 endif()
 
+# 16 KB page alignment for Android 15+/16 devices with 16 KB memory pages
+# (e.g. Snapdragon 8 Elite Gen 5 / SM8850). NDK 25 links .so at 4 KB by
+# default, which trips the OS "ELF alignment check" compatibility warning.
+# Force 16 KB LOAD-segment alignment so our libraries pass. Applies to every
+# target declared after this line.
+add_link_options(-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384)
+
 # ============================================================
 # qnn_depth_jni — preprocessing helpers for the ORT-QNN code path
 # (inference lives in ONNX Runtime / Java).

@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.media.Image
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.IOException
@@ -72,18 +73,39 @@ class DepthEstimatorQNN(
                 // QNN EP options — kept explicit so we can diagnose which one
                 // QNN_DEVICE_ERROR_INVALID_CONFIG rejects.
                 //
-                // Key values for Galaxy S25 (Snapdragon 8 Elite):
-                //   soc_model = 69    → QNN_SOC_MODEL_SM8750 (see QnnTypes.h)
-                //   htp_arch  = 79    → Hexagon V79
+                // soc_model / htp_arch must match the actual Hexagon on the
+                // device or QNN compiles the ONNX graph for the wrong arch.
+                //   soc_model values → QnnTypes.h    (QNN_SOC_MODEL_*)
+                //   htp_arch  values → QnnHtpDevice.h (QNN_HTP_DEVICE_ARCH_*)
+                // Skel/stub for each arch are bundled in app/libs/arm64-v8a/
+                // (V69/V73/V79/V81 shipped from QAIRT 2.42).
                 //
                 // Using absolute path to libQnnHtp.so guarantees we hit our
                 // shipped QAIRT 2.42 lib (not whatever Android linker picks).
                 val nativeLibDir = context.applicationInfo.nativeLibraryDir
-                val ctxCachePath = File(cacheDir, "depth_anything_qnn_ctx.bin").absolutePath
+
+                val socName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    Build.SOC_MODEL
+                } else {
+                    ""
+                }
+                val (socModel, htpArch) = when (socName) {
+                    "SM8450" -> "36" to "69"  // Snapdragon 8 Gen 1  (S22)  / Hexagon V69
+                    "SM8550" -> "43" to "73"  // Snapdragon 8 Gen 2          / Hexagon V73
+                    "SM8650" -> "57" to "75"  // Snapdragon 8 Gen 3          / Hexagon V75
+                    "SM8750" -> "69" to "79"  // Snapdragon 8 Elite  (S25)   / Hexagon V79
+                    "SM8850" -> "87" to "81"  // Snapdragon 8 Elite Gen 5    / Hexagon V81
+                    else     -> "87" to "81"  // default to newest bundled skel (V81)
+                }
+                Log.i(tag, "  Detected SoC: '$socName' → soc_model=$socModel, htp_arch=$htpArch")
+
+                // Cache is keyed by arch so switching devices never reuses a
+                // context binary compiled for a different Hexagon version.
+                val ctxCachePath = File(cacheDir, "depth_anything_qnn_ctx_v$htpArch.bin").absolutePath
                 val qnnOptions = mapOf(
                     "backend_path" to "$nativeLibDir/libQnnHtp.so",
-                    "soc_model" to "69",   // SM8750 (Snapdragon 8 Elite / S25)
-                    "htp_arch" to "79",    // Hexagon V79
+                    "soc_model" to socModel,
+                    "htp_arch" to htpArch,
                     // `sustained_high_performance` keeps NPU at a high but
                     // thermally sustainable clock. `burst` is for single-shot
                     // latency benchmarks (matches AI Hub's 22.8 ms claim) but
