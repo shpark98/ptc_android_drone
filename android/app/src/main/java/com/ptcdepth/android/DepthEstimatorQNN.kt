@@ -163,6 +163,7 @@ class DepthEstimatorQNN(
      * @param output Pre-allocated array sized [dstW * dstH] to receive normalized
      *               inverse depth in [0, 1] (high=close, low=far).
      */
+    @Synchronized
     fun processFrame(
         yData: ByteArray, uData: ByteArray, vData: ByteArray,
         imgW: Int, imgH: Int,
@@ -170,9 +171,6 @@ class DepthEstimatorQNN(
         rotationDegrees: Int,
         output: FloatArray, dstW: Int, dstH: Int,
     ): Boolean {
-        val env = ortEnv ?: return false
-        val session = ortSession ?: return false
-
         val t0 = System.currentTimeMillis()
 
         val ok = nativePreprocessYUVBytesInto(
@@ -182,8 +180,43 @@ class DepthEstimatorQNN(
             inputBuffer,
         )
         if (!ok) return false
-
         val t1 = System.currentTimeMillis()
+
+        return runInference(output, dstW, dstH, t0, t1, "YUV")
+    }
+
+    /** Run the depth model on a Fieldscale ARGB grayscale frame. */
+    @Synchronized
+    fun processArgbFrame(
+        pixels: IntArray,
+        imgW: Int,
+        imgH: Int,
+        rotationDegrees: Int,
+        output: FloatArray,
+        dstW: Int,
+        dstH: Int,
+    ): Boolean {
+        val t0 = System.currentTimeMillis()
+        val ok = nativePreprocessARGBInto(
+            pixels, imgW, imgH,
+            inputWidth, inputHeight, rotationDegrees,
+            inputBuffer,
+        )
+        if (!ok) return false
+        val t1 = System.currentTimeMillis()
+        return runInference(output, dstW, dstH, t0, t1, "Fieldscale")
+    }
+
+    private fun runInference(
+        output: FloatArray,
+        dstW: Int,
+        dstH: Int,
+        t0: Long,
+        t1: Long,
+        source: String,
+    ): Boolean {
+        val env = ortEnv ?: return false
+        val session = ortSession ?: return false
 
         val shape = longArrayOf(1, 3, inputHeight.toLong(), inputWidth.toLong())
         val inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputBuffer), shape)
@@ -209,7 +242,8 @@ class DepthEstimatorQNN(
         System.arraycopy(resized, 0, output, 0, min(resized.size, output.size))
 
         val t3 = System.currentTimeMillis()
-        Log.d(tag, "ORT-QNN: prep=${t1 - t0}ms infer=${t2 - t1}ms post=${t3 - t2}ms total=${t3 - t0}ms")
+        Log.d(tag, "ORT-QNN[$source]: prep=${t1 - t0}ms infer=${t2 - t1}ms " +
+            "post=${t3 - t2}ms total=${t3 - t0}ms")
 
         return true
     }
@@ -264,6 +298,16 @@ class DepthEstimatorQNN(
         imgWidth: Int, imgHeight: Int,
         yRowStride: Int, uvRowStride: Int, uvPixelStride: Int,
         targetWidth: Int, targetHeight: Int,
+        rotationDegrees: Int,
+        outBuffer: FloatArray,
+    ): Boolean
+
+    private external fun nativePreprocessARGBInto(
+        pixels: IntArray,
+        imgWidth: Int,
+        imgHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
         rotationDegrees: Int,
         outBuffer: FloatArray,
     ): Boolean

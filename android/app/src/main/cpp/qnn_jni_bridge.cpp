@@ -105,6 +105,68 @@ Java_com_ptcdepth_android_DepthEstimatorQNN_nativePreprocessYUVBytesInto(
     return JNI_TRUE;
 }
 
+// Fieldscale ARGB (grayscale) -> rotated/resized NCHW RGB float in [0,1].
+JNIEXPORT jboolean JNICALL
+Java_com_ptcdepth_android_DepthEstimatorQNN_nativePreprocessARGBInto(
+        JNIEnv* env, jobject /*thiz*/,
+        jintArray pixelsArray, jint imgWidth, jint imgHeight,
+        jint targetWidth, jint targetHeight, jint rotationDegrees,
+        jfloatArray outBuffer) {
+    const int srcW = imgWidth, srcH = imgHeight;
+    const int tW = targetWidth, tH = targetHeight;
+    const int pixelCount = tW * tH;
+    if (!pixelsArray || srcW <= 1 || srcH <= 1 ||
+        env->GetArrayLength(pixelsArray) != srcW * srcH ||
+        env->GetArrayLength(outBuffer) < 3 * pixelCount) {
+        return JNI_FALSE;
+    }
+
+    auto* pixels = static_cast<const uint32_t*>(
+        env->GetPrimitiveArrayCritical(pixelsArray, nullptr));
+    auto* output = static_cast<float*>(
+        env->GetPrimitiveArrayCritical(outBuffer, nullptr));
+    if (!pixels || !output) {
+        if (pixels) env->ReleasePrimitiveArrayCritical(pixelsArray, (void*)pixels, JNI_ABORT);
+        if (output) env->ReleasePrimitiveArrayCritical(outBuffer, output, JNI_ABORT);
+        return JNI_FALSE;
+    }
+
+    for (int ty = 0; ty < tH; ++ty) {
+        for (int tx = 0; tx < tW; ++tx) {
+            float srcXf, srcYf;
+            if (rotationDegrees == 90) {
+                srcXf = static_cast<float>(ty) * (srcW - 1) / (tH - 1);
+                srcYf = (srcH - 1) - static_cast<float>(tx) * (srcH - 1) / (tW - 1);
+            } else if (rotationDegrees == 270) {
+                srcXf = (srcW - 1) - static_cast<float>(ty) * (srcW - 1) / (tH - 1);
+                srcYf = static_cast<float>(tx) * (srcH - 1) / (tW - 1);
+            } else if (rotationDegrees == 180) {
+                srcXf = (srcW - 1) - static_cast<float>(tx) * (srcW - 1) / (tW - 1);
+                srcYf = (srcH - 1) - static_cast<float>(ty) * (srcH - 1) / (tH - 1);
+            } else {
+                srcXf = static_cast<float>(tx) * (srcW - 1) / (tW - 1);
+                srcYf = static_cast<float>(ty) * (srcH - 1) / (tH - 1);
+            }
+            const int srcX = std::max(0, std::min(static_cast<int>(srcXf + 0.5f), srcW - 1));
+            const int srcY = std::max(0, std::min(static_cast<int>(srcYf + 0.5f), srcH - 1));
+            const uint32_t argb = pixels[srcY * srcW + srcX];
+            // Fieldscale is already a one-channel image packed into ARGB with
+            // identical R/G/B bytes. Read the packed grayscale byte directly
+            // and replicate it to the three model channels; do not interpret
+            // the input as a color image or perform a separate R-channel path.
+            const float gray = static_cast<float>(argb & 0xFFu) / 255.0f;
+            const int index = ty * tW + tx;
+            output[index] = gray;
+            output[pixelCount + index] = gray;
+            output[2 * pixelCount + index] = gray;
+        }
+    }
+
+    env->ReleasePrimitiveArrayCritical(pixelsArray, (void*)pixels, JNI_ABORT);
+    env->ReleasePrimitiveArrayCritical(outBuffer, output, 0);
+    return JNI_TRUE;
+}
+
 JNIEXPORT jfloatArray JNICALL
 Java_com_ptcdepth_android_DepthEstimatorQNN_nativeResizeDepth(
         JNIEnv* env, jobject /*thiz*/,

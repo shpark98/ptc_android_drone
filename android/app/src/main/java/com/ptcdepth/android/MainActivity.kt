@@ -7,6 +7,7 @@ import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Environment
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -20,7 +21,10 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
+import java.util.Arrays
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
@@ -49,6 +53,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var splitContainer: LinearLayout
     private lateinit var compareContainer: LinearLayout
     private lateinit var pointCloudView: PointCloudView
+    private lateinit var flirContainer: FrameLayout
+    private lateinit var flirImage: ImageView
+    private lateinit var flirDepthVisualizer: DepthVisualizerView
+    private lateinit var textFlirStatus: TextView
+    private lateinit var textFlirFps: TextView
+    private lateinit var btnFlirRotate: TextView
+    private lateinit var btnFlirPalette: TextView
+    private lateinit var btnFlirRender: TextView
+    private lateinit var btnFlirDepth: TextView
+    private lateinit var btnFlirCaptureRaw: TextView
     private lateinit var cameraSplit: ImageView
     private lateinit var cameraView: ImageView
     private lateinit var btnToggleRefine: TextView
@@ -68,6 +82,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var textViewRotation: TextView
     private lateinit var textViewMatches: TextView
     private lateinit var textViewAbsRel: TextView
+    private lateinit var textWheelEncoder: TextView
+
+    // Receive-only AgileX wheel encoder debug path (gs_usb, 500 kbit/s).
+    private val agilexCanDecoder = AgilexCanDecoder()
+    private var gsUsbCanReceiver: GsUsbCanReceiver? = null
+    @Volatile private var lastWheelUiUpdateMs = 0L
+    @Volatile private var usbCanStatus = "No gs_usb-style USB-CAN adapter found"
+    @Volatile private var lastRawCanFrame: CanFrame? = null
+    @Volatile private var rawCanFrameCount = 0L
 
     // PTC-Depth pipeline
     private var depthRefinementMgr: DepthRefinementManager? = null
@@ -92,9 +115,17 @@ class MainActivity : AppCompatActivity() {
 
     // State
     private var prevPose: CameraPose? = null
+    private data class TimedArCorePose(val timestampNs: Long, val pose: CameraPose)
+    private val arCorePoseLock = Any()
+    private val arCorePoseBuffer = ArrayDeque<TimedArCorePose>()
+    private val maxArCorePoseBufferSize = 30
+    private val maxPoseMatchErrorNs = 150_000_000L
+    // FLIR callback timestamps are captured on elapsedRealtimeNanos(). Keep this
+    // configurable so a measured USB/SDK capture latency can be compensated later.
+    @Volatile private var flirTimestampOffsetNs = 0L
     private var useGTPose = false
     @Volatile private var isProcessing = false
-    private var viewMode = VIEW_SPLIT  // 0=Split, 1=Overlay, 2=3D
+    private var viewMode = VIEW_SPLIT
     private var useRefinement = false
     private var showTriDepth = false  // Debug: show raw triangulated depth instead of fused
     private var useRGBColor = false  // 3D point cloud color mode (false=colormap, true=RGB)
@@ -150,9 +181,36 @@ class MainActivity : AppCompatActivity() {
     private lateinit var depthThread: HandlerThread
     private lateinit var depthHandler: Handler
 
+    // FLIR USB thermal camera (active only while the FLIR tab is selected)
+    private var flirCameraController: FlirCameraController? = null
+    // FLIR integration is disabled; the legacy controller fields remain only
+    // until the old thermal sources are removed from the project completely.
+    private var flirSdkReady = false
+    private var lastFlirBitmap: Bitmap? = null
+    private val flirFrameLock = Any()
+    private var pendingFlirBitmap: Bitmap? = null
+    private val flirFrameUiScheduled = AtomicBoolean(false)
+    private var flirRotationDegrees = 0
+    @Volatile private var flirDepthEnabled = false
+    private val flirDepthProcessing = AtomicBoolean(false)
+    private val lastFlirDepthStartMs = AtomicLong(0L)
+    private var flirDepthOutput: FloatArray? = null
+    private var flirPtcMgr: DepthRefinementManager? = null
+    private var flirPtcIntrinsics: CameraIntrinsics? = null
+    private var flirPrevPose: CameraPose? = null
+    private var flirRawNormLow = Float.NaN
+    private var flirRawNormHigh = Float.NaN
+    private val flirRawCaptureRemaining = AtomicLong(0L)
+    private var flirRawCaptureDir: File? = null
+    private var flirY: ByteArray? = null
+    private var flirU: ByteArray? = null
+    private var flirV: ByteArray? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         setContentView(R.layout.activity_main)
+        setupWheelEncoderDebug()
 
         if (!checkPermissions()) {
             requestPermissions()
@@ -277,6 +335,16 @@ class MainActivity : AppCompatActivity() {
         splitContainer = findViewById(R.id.split_container)
         compareContainer = findViewById(R.id.compare_container)
         pointCloudView = findViewById(R.id.point_cloud_view)
+        flirContainer = findViewById(R.id.flir_container)
+        flirImage = findViewById(R.id.flir_image)
+        flirDepthVisualizer = findViewById(R.id.flir_depth_visualizer)
+        textFlirStatus = findViewById(R.id.text_flir_status)
+        textFlirFps = findViewById(R.id.text_flir_fps)
+        btnFlirRotate = findViewById(R.id.btn_flir_rotate)
+        btnFlirPalette = findViewById(R.id.btn_flir_palette)
+        btnFlirRender = findViewById(R.id.btn_flir_render)
+        btnFlirDepth = findViewById(R.id.btn_flir_depth)
+        btnFlirCaptureRaw = findViewById(R.id.btn_flir_capture_raw)
         cameraSplit = findViewById(R.id.camera_split)
         cameraView = findViewById(R.id.camera_view)
         btnToggleRefine = findViewById(R.id.btn_toggle_refine)
@@ -335,6 +403,64 @@ class MainActivity : AppCompatActivity() {
         val tabCompare = findViewById<TextView>(R.id.tab_compare)
         val tab3d = findViewById<TextView>(R.id.tab_3d)
         modeTabs = arrayOf(tabSplit, tabOverlay, tabDepth, tabCompare, tab3d)
+
+        if (flirSdkReady) {
+            flirCameraController = FlirCameraController(
+                context = this,
+                onStatus = { status ->
+                    runOnUiThread {
+                        if (::textFlirStatus.isInitialized) {
+                            textFlirStatus.text = status
+                            textFlirStatus.visibility = View.VISIBLE
+                        }
+                    }
+                },
+                onFrame = { bitmap ->
+                    enqueueFlirFrame(bitmap)
+                },
+                onFps = { fps, isFieldscaleOutput ->
+                    runOnUiThread {
+                        if (::textFlirFps.isInitialized) {
+                            val source = if (isFieldscaleOutput) "Fieldscale output" else "FLIR input"
+                            textFlirFps.text = "$source FPS: %.1f".format(fps)
+                        }
+                    }
+                },
+                onFieldscaleFrame = { timestampNs, _, temperatures, width, height, rotation ->
+                    // B path: show and feed DAV2/PTC the same temporally stabilized
+                    // normalization of the raw thermal data.
+                    saveRawThermalFrameIfRequested(timestampNs, temperatures, width, height)
+                    val rawPixels = normalizeRawThermalToArgb(temperatures, width, height)
+                    enqueueRawThermalBitmap(rawPixels, width, height, rotation)
+                    processFlirFieldscaleForPtc(timestampNs, rawPixels, width, height, rotation)
+                },
+            ).also {
+                it.setRotation(flirRotationDegrees)
+                it.setDisplayFieldscaleOutput(false)
+                updateFlirRenderControls(it.isFieldscaleEnabled())
+            }
+            textFlirStatus.setOnClickListener { flirCameraController?.restart() }
+            btnFlirRender.setOnClickListener {
+                val enabled = flirCameraController?.toggleFieldscale() ?: return@setOnClickListener
+                updateFlirRenderControls(enabled)
+            }
+            btnFlirDepth.setOnClickListener {
+                // FLIR-to-depth integration is temporarily disabled while the
+                // standalone Fieldscale stream is validated.
+            }
+            btnFlirDepth.visibility = View.GONE
+            btnFlirRotate.setOnClickListener {
+                flirRotationDegrees = (flirRotationDegrees + 90) % 360
+                flirCameraController?.setRotation(flirRotationDegrees)
+                flirPtcIntrinsics = null
+                btnFlirRotate.text = "Rotate ${flirRotationDegrees}°"
+            }
+            btnFlirCaptureRaw.setOnClickListener { startFlirRawCapture() }
+        } else {
+            // FLIR One SDK path is intentionally disabled. Do not expose its
+            // Legacy thermal SDK path is disabled.
+            textFlirStatus.visibility = View.GONE
+        }
 
         modeTabs.forEachIndexed { index, tab ->
             tab.setOnClickListener {
@@ -447,7 +573,432 @@ class MainActivity : AppCompatActivity() {
         isUIReady = true
     }
 
+    private fun updateFlirRenderControls(fieldscaleEnabled: Boolean) {
+        btnFlirRender.text = if (fieldscaleEnabled) "FLIR (Raw thermal)" else "FLIR"
+        btnFlirPalette.visibility = View.GONE
+        btnFlirDepth.visibility = View.GONE
+        flirDepthVisualizer.visibility = if (viewMode == VIEW_FLIR) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * Keep at most one FLIR bitmap waiting for the UI thread. If rendering falls
+     * behind, intermediate frames are discarded instead of building a queue that
+     * makes both halves of the FLIR view appear frozen.
+     */
+    private fun enqueueFlirFrame(bitmap: Bitmap) {
+        val dropped = synchronized(flirFrameLock) {
+            val previous = pendingFlirBitmap
+            pendingFlirBitmap = bitmap
+            previous
+        }
+        dropped?.takeIf { it !== bitmap && !it.isRecycled }?.recycle()
+        scheduleFlirFrameUiUpdate()
+    }
+
+    private fun scheduleFlirFrameUiUpdate() {
+        if (!flirFrameUiScheduled.compareAndSet(false, true)) return
+        runOnUiThread {
+            val bitmap = synchronized(flirFrameLock) {
+                pendingFlirBitmap.also { pendingFlirBitmap = null }
+            }
+            if (bitmap != null) {
+                if (!::flirImage.isInitialized || isFinishing || isDestroyed) {
+                    bitmap.takeIf { !it.isRecycled }?.recycle()
+                } else {
+                    val previous = lastFlirBitmap
+                    lastFlirBitmap = bitmap
+                    flirImage.setImageBitmap(bitmap)
+                    textFlirStatus.visibility = View.GONE
+                    previous?.takeIf { it !== bitmap && !it.isRecycled }?.recycle()
+                }
+            }
+
+            flirFrameUiScheduled.set(false)
+            val hasPendingFrame = synchronized(flirFrameLock) { pendingFlirBitmap != null }
+            if (hasPendingFrame) scheduleFlirFrameUiUpdate()
+        }
+    }
+
+    private fun processFlirDepthFrame(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int,
+    ) {
+        if (!flirDepthEnabled) return
+        val qnn = depthEstimatorQNN ?: return
+        if (viewMode != VIEW_FLIR) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastFlirDepthStartMs.get() < FLIR_DEPTH_INTERVAL_MS) return
+        if (!flirDepthProcessing.compareAndSet(false, true)) return
+        lastFlirDepthStartMs.set(now)
+        val rotated = rotationDegrees == 90 || rotationDegrees == 270
+        val outputWidth = if (rotated) height else width
+        val outputHeight = if (rotated) width else height
+        qnnExecutor.execute {
+            try {
+                var output = flirDepthOutput
+                if (output == null || output.size != outputWidth * outputHeight) {
+                    output = FloatArray(outputWidth * outputHeight)
+                    flirDepthOutput = output
+                }
+                val success = qnn.processArgbFrame(
+                    pixels,
+                    width,
+                    height,
+                    rotationDegrees,
+                    output,
+                    outputWidth,
+                    outputHeight,
+                )
+                if (success) {
+                    val displayedDepth = output.copyOf()
+                    runOnUiThread {
+                        if (flirDepthEnabled && viewMode == VIEW_FLIR &&
+                            ::flirDepthVisualizer.isInitialized
+                        ) {
+                            flirDepthVisualizer.updateDepth(
+                                displayedDepth,
+                                outputWidth,
+                                outputHeight,
+                            )
+                        }
+                    }
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "FLIR Fieldscale depth inference failed", error)
+            } finally {
+                flirDepthProcessing.set(false)
+            }
+        }
+    }
+
+    /**
+     * Convert raw FLIR temperatures to stable grayscale ARGB for DAV2.
+     * Percentile limits avoid hot/cold outliers; EMA prevents frame-to-frame
+     * contrast pumping (the main source of flicker with per-frame min/max).
+     */
+    private fun normalizeRawThermalToArgb(
+        temperatures: DoubleArray,
+        width: Int,
+        height: Int,
+    ): IntArray {
+        val count = width * height
+        if (temperatures.size != count) return IntArray(count)
+        val finite = FloatArray(count)
+        var n = 0
+        for (value in temperatures) {
+            if (value.isFinite()) finite[n++] = value.toFloat()
+        }
+        if (n == 0) return IntArray(count)
+        val values = finite.copyOf(n)
+        values.sort()
+        fun percentile(p: Float): Float {
+            val index = ((n - 1) * p).coerceIn(0f, (n - 1).toFloat()).toInt()
+            return values[index]
+        }
+        var low = percentile(0.02f)
+        var high = percentile(0.98f)
+        if (high - low < 1.0f) {
+            val center = (high + low) * 0.5f
+            low = center - 0.5f
+            high = center + 0.5f
+        }
+        if (flirRawNormLow.isNaN()) {
+            flirRawNormLow = low
+            flirRawNormHigh = high
+        } else {
+            flirRawNormLow = flirRawNormLow * 0.8f + low * 0.2f
+            flirRawNormHigh = flirRawNormHigh * 0.8f + high * 0.2f
+        }
+        low = flirRawNormLow
+        high = maxOf(flirRawNormHigh, low + 1.0f)
+        val output = IntArray(count)
+        val scale = 255f / (high - low)
+        for (i in 0 until count) {
+            val value = temperatures[i].toFloat()
+            val gray = if (value.isFinite()) {
+                ((value - low) * scale).toInt().coerceIn(0, 255)
+            } else {
+                0
+            }
+            output[i] = uncheckedArgb(gray)
+        }
+        return output
+    }
+
+    private fun startFlirRawCapture() {
+        val root = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        val dir = File(root, "flir_raw_${System.currentTimeMillis()}").apply { mkdirs() }
+        flirRawCaptureDir = dir
+        flirRawCaptureRemaining.set(30L)
+        File(dir, "README.txt").writeText(
+            "FLIR thermal frames exported by depth_android\n" +
+                "dtype: uint16 little-endian\n" +
+                "encoding: Celsius * 100 (getValues() output)\n" +
+                "decode: temperature_celsius = frame_uint16 / 100.0\n",
+        )
+        textFlirStatus.text = "Saving 30 raw frames to ${dir.absolutePath}"
+        textFlirStatus.visibility = View.VISIBLE
+        Log.i(TAG, "Started FLIR raw capture: ${dir.absolutePath}")
+    }
+
+    private fun saveRawThermalFrameIfRequested(
+        timestampNs: Long,
+        temperatures: DoubleArray,
+        width: Int,
+        height: Int,
+    ) {
+        val previous = flirRawCaptureRemaining.getAndDecrement()
+        if (previous <= 0L) {
+            flirRawCaptureRemaining.set(0L)
+            return
+        }
+        val dir = flirRawCaptureDir ?: return
+        val index = 30L - previous
+        try {
+            NpyUint16Writer.write(
+                File(dir, "frame_%03d_t%016d.npy".format(index, timestampNs)),
+                temperatures,
+                width,
+                height,
+            )
+            val remaining = previous - 1L
+            runOnUiThread {
+                textFlirStatus.text = if (remaining > 0) {
+                    "Saving raw frames: $remaining remaining"
+                } else {
+                    "Saved 30 raw frames: ${dir.absolutePath}"
+                }
+            }
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to save FLIR raw frame", error)
+        }
+    }
+
+    private fun uncheckedArgb(gray: Int): Int {
+        return (0xFF shl 24) or (gray shl 16) or (gray shl 8) or gray
+    }
+
+    private fun enqueueRawThermalBitmap(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int,
+    ) {
+        try {
+            val source = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            source.setPixels(pixels, 0, width, 0, 0, width, height)
+            val display = if (rotationDegrees == 0) {
+                source
+            } else {
+                Bitmap.createBitmap(
+                    source, 0, 0, width, height,
+                    android.graphics.Matrix().apply { postRotate(rotationDegrees.toFloat()) },
+                    true,
+                ).also { source.recycle() }
+            }
+            enqueueFlirFrame(display)
+        } catch (error: Throwable) {
+            Log.e(TAG, "Failed to render raw thermal frame", error)
+        }
+    }
+
+    /**
+     * Experimental FLIR path:
+     * Raw thermal grayscale -> Depth Anything inverse depth -> PTC refinement.
+     * FLIR is assumed rigidly mounted to the phone, so the current ARCore
+     * relative pose is used directly. Intrinsics are deliberately approximate
+     * until a thermal calibration is available.
+     */
+    private fun processFlirFieldscaleForPtc(
+        timestampNs: Long,
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        rotationDegrees: Int,
+    ) {
+        if (viewMode != VIEW_FLIR) return
+        val qnn = depthEstimatorQNN ?: return
+        if (!flirDepthProcessing.compareAndSet(false, true)) return
+
+        val matchedTimestampNs = timestampNs + flirTimestampOffsetNs
+        val currentPose = findArCorePose(matchedTimestampNs)
+        val previousPose = flirPrevPose
+        flirPrevPose = currentPose
+        val relPose = if (previousPose != null && currentPose != null) {
+            try { arCoreManager.computeRelativePose(previousPose, currentPose) } catch (_: Throwable) { null }
+        } else null
+        qnnExecutor.execute {
+            try {
+                val rotated = rotationDegrees == 90 || rotationDegrees == 270
+                val outW = if (rotated) height else width
+                val outH = if (rotated) width else height
+                val intrinsics = flirPtcIntrinsics ?: CameraIntrinsics(
+                    fx = outW.toFloat(),
+                    fy = outH.toFloat(),
+                    cx = (outW - 1) * 0.5f,
+                    cy = (outH - 1) * 0.5f,
+                    width = outW,
+                    height = outH,
+                ).also { flirPtcIntrinsics = it }
+
+                val inputW = qnn.inputWidth
+                val inputH = qnn.inputHeight
+                var inverseDepth = flirDepthOutput
+                if (inverseDepth == null || inverseDepth.size != inputW * inputH) {
+                    inverseDepth = FloatArray(inputW * inputH)
+                    flirDepthOutput = inverseDepth
+                }
+
+                // Fieldscale output is grayscale ARGB. Feed it to Depth
+                // Anything, then expose the same image as synthetic YUV to PTC.
+                if (!qnn.processArgbFrame(
+                        pixels, width, height, rotationDegrees,
+                        inverseDepth, inputW, inputH,
+                    )) return@execute
+
+                // Mono mode shows the raw Depth Anything result. Do not run
+                // the temporal PTC stage unless the user explicitly selects
+                // Refined.
+                if (!useRefinement) {
+                    val mono = resizeFloatBilinear(
+                        inverseDepth, inputW, inputH, intrinsics.width, intrinsics.height,
+                    )
+                    runOnUiThread {
+                        if (viewMode == VIEW_FLIR) {
+                            flirDepthVisualizer.updateDepth(mono, intrinsics.width, intrinsics.height)
+                        }
+                    }
+                    return@execute
+                }
+                if (relPose == null) return@execute
+
+                val mgr = flirPtcMgr ?: DepthRefinementManager(
+                    intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
+                    intrinsics.width, intrinsics.height, useExternalPose = true,
+                ).also {
+                    it.updateConfig(iterative = 0, verbose = false)
+                    flirPtcMgr = it
+                    runOnUiThread { if (viewMode == VIEW_FLIR) flirDepthVisualizer.visibility = View.VISIBLE }
+                }
+
+                val ySize = width * height
+                val uvW = (width + 1) / 2
+                val uvH = (height + 1) / 2
+                if (flirY == null || flirY!!.size != ySize) flirY = ByteArray(ySize)
+                if (flirU == null || flirU!!.size != uvW * uvH) flirU = ByteArray(uvW * uvH)
+                if (flirV == null || flirV!!.size != uvW * uvH) flirV = ByteArray(uvW * uvH)
+                val yPlane = flirY!!
+                for (i in pixels.indices) yPlane[i] = (pixels[i] and 0xFF).toByte()
+                Arrays.fill(flirU!!, 0x80.toByte())
+                Arrays.fill(flirV!!, 0x80.toByte())
+
+                mgr.prepareFlow(
+                    yPlane, flirU!!, flirV!!,
+                    width, height, width, uvW, 1, rotationDegrees,
+                )
+                val result = mgr.processFrameSync(
+                    yPlane, flirU!!, flirV!!,
+                    width, height, width, uvW, 1, rotationDegrees,
+                    inverseDepth, inputW, inputH,
+                    relPose.baseline, relPose.R, relPose.t,
+                ) ?: return@execute
+
+                val display = result.refinedDepth.copyOf()
+                runOnUiThread {
+                    if (viewMode == VIEW_FLIR) {
+                        flirDepthVisualizer.setMetricDepth(display, intrinsics.width, intrinsics.height)
+                        flirDepthVisualizer.updateDepth(
+                            normalizeMetricDepth(display), intrinsics.width, intrinsics.height,
+                        )
+                    }
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "FLIR Fieldscale -> PTC failed", error)
+            } finally {
+                flirDepthProcessing.set(false)
+            }
+        }
+    }
+
+    private fun setupWheelEncoderDebug() {
+        textWheelEncoder = findViewById(R.id.text_wheel_encoder)
+        gsUsbCanReceiver = GsUsbCanReceiver(this, object : GsUsbCanReceiver.Listener {
+            override fun onStatus(status: String) {
+                usbCanStatus = status
+                Log.i(TAG, status)
+                runOnUiThread {
+                    textWheelEncoder.text = formatWheelEncoderDebug(status, agilexCanDecoder.snapshot())
+                }
+            }
+
+            override fun onFrame(frame: CanFrame) {
+                lastRawCanFrame = frame
+                rawCanFrameCount++
+                val snapshot = agilexCanDecoder.accept(frame) ?: agilexCanDecoder.snapshot()
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastWheelUiUpdateMs < WHEEL_UI_INTERVAL_MS) return
+                lastWheelUiUpdateMs = now
+                runOnUiThread {
+                    textWheelEncoder.text = formatWheelEncoderDebug(usbCanStatus, snapshot)
+                }
+            }
+        }).also { it.start() }
+    }
+
+    private fun formatWheelEncoderDebug(
+        status: String,
+        snapshot: AgilexWheelEncoderSnapshot,
+    ): String {
+        val odometry = if (snapshot.leftOdometry != null && snapshot.rightOdometry != null) {
+            "ODO L=${snapshot.leftOdometry}  R=${snapshot.rightOdometry}"
+        } else {
+            "ODO L=--  R=--"
+        }
+        val motors = if (snapshot.motors.isEmpty()) {
+            "MOTOR pulse: waiting for 0x251..0x258"
+        } else {
+            snapshot.motors.joinToString(separator = "   ") {
+                "M${it.motorId} rpm=${it.rpm} pulse=${it.pulseCount}"
+            }
+        }
+        val lastRx = lastRawCanFrame?.let { frame ->
+            val bytes = frame.data.joinToString(separator = " ") { "%02X".format(it.toInt() and 0xff) }
+            "0x%03X [$bytes]".format(frame.id)
+        } ?: "--"
+        // CAN transmission is intentionally disabled during encoder bring-up.
+        return "$status | RX#$rawCanFrameCount=$lastRx | TX=--\n$odometry\n$motors"
+    }
+
     private fun setupParameterPanel() {
+        // Fieldscale controls (applied on release so dragging stays responsive).
+        val seekFsMax = findViewById<SeekBar>(R.id.seek_fs_max_diff)
+        val seekFsMin = findViewById<SeekBar>(R.id.seek_fs_min_diff)
+        val seekFsIter = findViewById<SeekBar>(R.id.seek_fs_iterations)
+        val seekFsGamma = findViewById<SeekBar>(R.id.seek_fs_gamma)
+        val labelFsMax = findViewById<TextView>(R.id.label_fs_max_diff)
+        val labelFsMin = findViewById<TextView>(R.id.label_fs_min_diff)
+        val labelFsIter = findViewById<TextView>(R.id.label_fs_iterations)
+        val labelFsGamma = findViewById<TextView>(R.id.label_fs_gamma)
+        val fsListener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                labelFsMax.text = "FS max diff: %.1f°C".format(seekFsMax.progress / 2f)
+                labelFsMin.text = "FS min diff: %.1f°C".format(seekFsMin.progress / 2f)
+                labelFsIter.text = "FS iterations: ${seekFsIter.progress}"
+                labelFsGamma.text = "FS gamma: %.2f".format(seekFsGamma.progress / 100f)
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) { pushFieldscaleConfig() }
+        }
+        seekFsMax.setOnSeekBarChangeListener(fsListener)
+        seekFsMin.setOnSeekBarChangeListener(fsListener)
+        seekFsIter.setOnSeekBarChangeListener(fsListener)
+        seekFsGamma.setOnSeekBarChangeListener(fsListener)
+        findViewById<Switch>(R.id.switch_fs_clahe).setOnCheckedChangeListener { _, _ ->
+            pushFieldscaleConfig()
+        }
+
         // RANSAC iterations (0-500)
         val seekRansac = findViewById<SeekBar>(R.id.seek_ransac)
         val labelRansac = findViewById<TextView>(R.id.label_ransac)
@@ -565,6 +1116,8 @@ class MainActivity : AppCompatActivity() {
         findViewById<View>(R.id.btn_reset_pipeline).setOnClickListener {
             depthRefinementMgr?.reset()
             prevPose = null
+            synchronized(arCorePoseLock) { arCorePoseBuffer.clear() }
+            flirPrevPose = null
             Toast.makeText(this, "Pipeline reset", Toast.LENGTH_SHORT).show()
         }
     }
@@ -652,6 +1205,24 @@ class MainActivity : AppCompatActivity() {
                 depthVisualizerOverlay.visibility = View.GONE
                 pointCloudView.visibility = View.VISIBLE
             }
+            VIEW_FLIR -> {
+                splitContainer.visibility = View.GONE
+                compareContainer.visibility = View.GONE
+                cameraView.visibility = View.GONE
+                depthVisualizerOverlay.visibility = View.GONE
+                pointCloudView.visibility = View.GONE
+                flirDepthVisualizer.visibility = View.VISIBLE
+            }
+        }
+
+        flirContainer.visibility = if (viewMode == VIEW_FLIR) View.VISIBLE else View.GONE
+        if (viewMode == VIEW_FLIR) {
+            flirCameraController?.start()
+        } else {
+            flirCameraController?.stop()
+            flirPrevPose = null
+            flirRawNormLow = Float.NaN
+            flirRawNormHigh = Float.NaN
         }
 
         // Update tab highlights
@@ -912,13 +1483,46 @@ class MainActivity : AppCompatActivity() {
     // Frame Processing
     // ========================================================================
 
+    /** Store the ARCore pose on the same timestamp axis used by FLIR callbacks. */
+    private fun recordArCorePose(frame: com.google.ar.core.Frame) {
+        val pose = try { arCoreManager.getCurrentPose() } catch (_: Throwable) { null } ?: return
+        // Android camera timestamps are the preferred match key.  Fall back to
+        // the ARCore frame timestamp if the device does not expose the former.
+        val timestampNs = try {
+            frame.getAndroidCameraTimestamp()
+        } catch (_: Throwable) {
+            frame.getTimestamp()
+        }
+        synchronized(arCorePoseLock) {
+            arCorePoseBuffer.addLast(TimedArCorePose(timestampNs, pose))
+            while (arCorePoseBuffer.size > maxArCorePoseBufferSize) {
+                arCorePoseBuffer.removeFirst()
+            }
+        }
+    }
+
+    /** Find the pose closest to a FLIR frame timestamp. */
+    private fun findArCorePose(timestampNs: Long): CameraPose? {
+        synchronized(arCorePoseLock) {
+            val match = arCorePoseBuffer.minByOrNull {
+                kotlin.math.abs(it.timestampNs - timestampNs)
+            } ?: return null
+            return if (kotlin.math.abs(match.timestampNs - timestampNs) <= maxPoseMatchErrorNs) {
+                match.pose
+            } else {
+                null
+            }
+        }
+    }
+
     /**
      * Called on GL thread with a fresh ARCore frame.
      * Acquires camera image and starts depth estimation.
      */
     private fun processFrame(frame: com.google.ar.core.Frame) {
+        if (!isPlaybackMode) recordArCorePose(frame)
         // Skip live processing during recording playback
-        if (isPlaybackMode) return
+        if (isPlaybackMode || viewMode == VIEW_FLIR) return
 
         // Always acquire camera image for display (even while depth is processing)
         val localCamW: Int
@@ -1654,6 +2258,7 @@ class MainActivity : AppCompatActivity() {
         // Re-attach frame callback only if setupUI() completed
         if (isUIReady) {
             arCoreRenderer.onNewFrame = { frame -> processFrame(frame) }
+            if (viewMode == VIEW_FLIR) flirCameraController?.start()
         }
     }
 
@@ -1691,7 +2296,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun pushFieldscaleConfig() {
+        if (!::settingsOverlay.isInitialized) return
+        val maxDiff = findViewById<SeekBar>(R.id.seek_fs_max_diff).progress / 2f
+        val minDiff = findViewById<SeekBar>(R.id.seek_fs_min_diff).progress / 2f
+        val iterations = findViewById<SeekBar>(R.id.seek_fs_iterations).progress
+        val gamma = findViewById<SeekBar>(R.id.seek_fs_gamma).progress / 100f
+        val clahe = findViewById<Switch>(R.id.switch_fs_clahe).isChecked
+        // Thermal Fieldscale configuration is disabled with the FLIR path.
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // A USB permission dialog pauses this Activity without fully hiding it.
+        // Keep FLIR alive through that transient pause and only close it when
+        // the Activity actually leaves the screen.
+        flirCameraController?.stop()
+    }
+
     override fun onDestroy() {
+        gsUsbCanReceiver?.stop()
+        gsUsbCanReceiver = null
+        flirPtcMgr?.destroy()
+        flirPtcMgr = null
+        flirCameraController?.release()
+        flirCameraController = null
+        synchronized(flirFrameLock) {
+            pendingFlirBitmap?.takeIf { !it.isRecycled }?.recycle()
+            pendingFlirBitmap = null
+        }
+        lastFlirBitmap?.takeIf { !it.isRecycled }?.recycle()
+        lastFlirBitmap = null
         super.onDestroy()
         recordingPlayer?.release()
         qnnExecutor.shutdown()
@@ -1765,10 +2400,14 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val PERMISSION_REQUEST_CODE = 100
+        private const val WHEEL_UI_INTERVAL_MS = 100L
+        private const val FLIR_DEPTH_INTERVAL_MS = 300L
         private const val VIEW_SPLIT = 0
         private const val VIEW_OVERLAY = 1
         private const val VIEW_DEPTH = 2
         private const val VIEW_COMPARE = 3
         private const val VIEW_3D = 4
+        // Thermal camera modes are not exposed in the UI.
+        private const val VIEW_FLIR = 99
     }
 }

@@ -1,4 +1,4 @@
-# AGENTS.md — guide for AI coding agents (Codex)
+ㄴ# AGENTS.md — guide for AI coding agents (Codex)
 
 Guidance for an AI agent working on this repository. (Claude Code reads
 `CLAUDE.md`, which carries the same facts.) Read this before making changes.

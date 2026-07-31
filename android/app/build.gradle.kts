@@ -5,7 +5,11 @@ plugins {
 
 android {
     namespace = "com.ptcdepth.android"
-    compileSdk = 34
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
 
     // NDK r27+ links native .so with 16 KB-aligned LOAD segments by default,
     // required for Android 15+/16 devices with 16 KB memory pages (SM8850).
@@ -13,7 +17,8 @@ android {
 
     defaultConfig {
         applicationId = "com.ptcdepth.android"
-        minSdk = 26  // ARCore minimum requirement
+        // FLIR Atlas Android SDK 2.22.0 requires Android 13 (API 33)+.
+        minSdk = 33
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
@@ -25,7 +30,10 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += listOf(
-                    "-DANDROID_STL=c++_shared",
+                    // FLIR Atlas 2.22 ships a newer 16 KB-aligned libc++_shared.
+                    // Link our isolated JNI modules statically so Gradle packages
+                    // the FLIR runtime required by libatlas_native.so.
+                    "-DANDROID_STL=c++_static",
                     "-DANDROID_PLATFORM=android-26"
                 )
                 cppFlags += listOf("-std=c++17", "-O3", "-ffast-math")
@@ -75,14 +83,11 @@ android {
         }
     }
 
-    // Don't compress the ONNX graph or its external weights so they can be
-    // memory-mapped from the APK / extracted to cache without re-inflating.
     androidResources {
+        // Keep model files uncompressed so runtime extraction/mapping does not
+        // need to inflate them first.
         noCompress += listOf("onnx", "data", "bin", "dlc")
-        // Exclude experimental model formats the app never loads. The active
-        // pipeline uses depth_anything_v2.onnx/.data (QNN) with
-        // depth_anything.onnx as the CPU fallback; the rest are leftovers that
-        // bloat the APK by ~527 MB and make USB installs slow/flaky.
+        // Exclude only unused experimental model formats.
         ignoreAssetsPatterns += listOf(
             "*.tflite",
             "*.dlc",
@@ -93,6 +98,10 @@ android {
 }
 
 dependencies {
+    // FLIR Atlas Android SDK 2.22.0 (provisioned locally; AARs are git-ignored).
+    implementation(files("libs/thermalsdk-release.aar"))
+    implementation(files("libs/androidsdk-release.aar"))
+
     // ARCore — 1.48+ ships 16 KB page-aligned native libraries
     implementation("com.google.ar:core:1.48.0")
 
@@ -116,4 +125,6 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+
+    testImplementation("junit:junit:4.13.2")
 }

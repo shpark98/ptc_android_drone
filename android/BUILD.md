@@ -136,7 +136,38 @@ for so in app/build/intermediates/merged_native_libs/debug/out/lib/arm64-v8a/*.s
 done
 ```
 
-## 7. Troubleshooting
+## 7. AgileX Scout wheel encoder debug (direct USB-CAN)
+
+The app contains a receive-only path matching the `gs_usb` CAN-to-USB setup in
+`agilexrobotics/ugv_sdk`. Android USB host talks directly to the adapter; there
+is no Linux `can0`, SocketCAN, serial-port library, or SLCAN text conversion in
+this path.
+
+1. Connect the phone in USB host/OTG mode to a `gs_usb`/candleLight-compatible
+   adapter, and connect the adapter to the Scout CAN bus.
+2. Power the Scout and accept the Android USB permission dialog.
+3. The app configures channel 0 for classic CAN at **500 kbit/s**, receive-only.
+4. Read the green three-line panel below the top HUD. It shows connection state,
+   last raw RX (`last TX` remains `--`), `0x311` left/right odometry counts, and
+   `0x251..0x258` motor RPM/pulse counts.
+
+The direct driver recognizes the same common VID/PID pairs as the upstream Linux
+`gs_usb` driver. `No gs_usb-style USB-CAN adapter found` means that no matching
+device is attached. An adapter in SLCAN/CDC serial mode is a different USB
+protocol and is intentionally not opened by this driver.
+
+Useful log filter:
+
+```bash
+adb logcat | grep -E "GsUsbCanReceiver|MainActivity"
+```
+
+Protocol V2 byte layout (from `ugv_sdk`): all multi-byte CAN payload fields are
+big-endian. `0x311` is two signed 32-bit wheel counts. Each motor high-speed
+state `0x251..0x258` is signed 16-bit RPM, signed 16-bit current in 0.1 A, and a
+signed 32-bit cumulative pulse count.
+
+## 8. Troubleshooting
 
 - **`adb shell` hangs / device shows but unresponsive** (often after an aborted
   large install): `adb kill-server && adb start-server`. Re-auth is not needed if
