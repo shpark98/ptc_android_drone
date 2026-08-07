@@ -224,6 +224,50 @@
         </LinearLayout>
     </FrameLayout>
 
+    <!-- PX4 telemetry/status tab. -->
+    <ScrollView
+        android:id="@+id/px4_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#101010"
+        android:visibility="gone"
+        android:padding="24dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/px4_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="PX4 Telemetry"
+                android:textColor="#FFFFFF"
+                android:textSize="22sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/px4_status_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="Waiting for PX4 USB connection"
+                android:textColor="#80E0A0"
+                android:textSize="16sp" />
+
+            <TextView
+                android:id="@+id/px4_telemetry_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="No MAVLink messages received"
+                android:textColor="#DDDDDD"
+                android:textSize="15sp"
+                android:fontFamily="monospace" />
+        </LinearLayout>
+    </ScrollView>
+
     <!-- 3D viewpoint controls (only visible in 3D mode) -->
     <LinearLayout
         android:id="@+id/preset_buttons"
@@ -429,6 +473,16 @@
             android:paddingEnd="8dp" />
 
         <TextView
+            android:id="@+id/vision_rate_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="CAM -- AR --"
+            android:textColor="#66FF99"
+            android:textSize="10sp"
+            android:fontFamily="monospace"
+            android:paddingEnd="8dp" />
+
+        <TextView
             android:id="@+id/text_absrel"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -541,9 +595,29 @@
         android:paddingBottom="3dp"
         android:text="USB-CAN starting...&#10;ODO L=--  R=--&#10;MOTOR pulse: waiting"
         android:textColor="#66FF99"
-        android:textSize="10sp" />
+        android:textSize="10sp"
+        android:visibility="gone" />
 
     </LinearLayout>
+
+    <!-- Wheel odometry/USB-CAN diagnostics, isolated from depth tabs. -->
+    <ScrollView
+        android:id="@+id/odom_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#101010"
+        android:visibility="gone"
+        android:padding="24dp">
+
+        <TextView
+            android:id="@+id/odom_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="USB-CAN starting...&#10;ODO L=--  R=--&#10;MOTOR pulse: waiting"
+            android:textColor="#66FF99"
+            android:textSize="15sp"
+            android:fontFamily="monospace" />
+    </ScrollView>
     <!-- end top container -->
 
     <!-- ============ PLAYBACK CONTROLS (shown during recording playback) ============ -->
@@ -690,6 +764,30 @@
             android:layout_weight="1"
             android:gravity="center"
             android:text="3D"
+            android:textColor="#666666"
+            android:textSize="12sp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp" />
+
+        <TextView
+            android:id="@+id/tab_px4"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="PX4"
+            android:textColor="#666666"
+            android:textSize="12sp"
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp" />
+
+        <TextView
+            android:id="@+id/tab_odom"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="Odom"
             android:textColor="#666666"
             android:textSize="12sp"
             android:paddingTop="4dp"
@@ -979,6 +1077,85 @@
 
             </LinearLayout>
         </ScrollView>
+    </FrameLayout>
+
+    <!-- App-wide diagnostic terminal. It stays above every tab and can be hidden. -->
+    <TextView
+        android:id="@+id/btn_toggle_terminal"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|top"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="12dp"
+        android:background="#CC202020"
+        android:clickable="true"
+        android:focusable="true"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="8dp"
+        android:paddingBottom="8dp"
+        android:text="LOG"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp" />
+
+    <FrameLayout
+        android:id="@+id/terminal_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="260dp"
+        android:layout_gravity="bottom"
+        android:layout_marginStart="8dp"
+        android:layout_marginEnd="8dp"
+        android:layout_marginBottom="8dp"
+        android:background="#EE101010"
+        android:elevation="20dp"
+        android:visibility="gone">
+
+        <ScrollView
+            android:id="@+id/terminal_scroll"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_marginBottom="42dp"
+            android:fillViewport="true">
+
+            <TextView
+                android:id="@+id/terminal_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:padding="10dp"
+                android:textColor="#B8FFB8"
+                android:textSize="11sp"
+                android:textIsSelectable="true" />
+        </ScrollView>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="42dp"
+            android:layout_gravity="bottom"
+            android:gravity="end|center_vertical"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_copy_terminal"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Copy"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btn_clear_terminal"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Clear"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btn_close_terminal"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:text="Close"
+                android:textSize="11sp" />
+        </LinearLayout>
     </FrameLayout>
 
 </FrameLayout>

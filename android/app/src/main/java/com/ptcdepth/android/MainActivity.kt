@@ -2,12 +2,16 @@ package com.ptcdepth.android
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.ContentValues
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.graphics.Bitmap
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -20,8 +24,18 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Arrays
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -72,6 +86,40 @@ class MainActivity : AppCompatActivity() {
     private lateinit var colorBar: ColorBarView
     private lateinit var presetButtons: LinearLayout
     private lateinit var zoomSliderContainer: LinearLayout
+    private lateinit var terminalOverlay: FrameLayout
+    private lateinit var terminalText: TextView
+    private lateinit var terminalScroll: android.widget.ScrollView
+    private lateinit var px4Container: View
+    private lateinit var px4StatusText: TextView
+    private lateinit var px4TelemetryText: TextView
+    private lateinit var visionRateText: TextView
+    private lateinit var odomContainer: View
+    private var px4UsbAutoConnector: Px4UsbAutoConnector? = null
+    private var px4MavlinkManager: Px4MavlinkManager? = null
+    private var phoneGyroscope: PhoneGyroscope? = null
+    private var lastPx4MessageLogMs = 0L
+    @Volatile private var px4RxMessageCount = 0L
+    @Volatile private var px4LastMessageName = "none"
+    private data class VioSample(
+        val timestampUs: Long,
+        val x: Float, val y: Float, val z: Float,
+        val qx: Float, val qy: Float, val qz: Float, val qw: Float,
+        val vx: Float, val vy: Float, val vz: Float,
+        val rollSpeed: Float, val pitchSpeed: Float, val yawSpeed: Float,
+    )
+    // A conflated channel delivers every fresh pose immediately when USB keeps
+    // up, and drops stale queued poses instead of increasing control latency.
+    private val vioSampleChannel = Channel<VioSample>(Channel.CONFLATED)
+    private var previousVioSample: VioSample? = null
+    private var vioTxJob: kotlinx.coroutines.Job? = null
+
+    // Measured from monotonically increasing ARCore frame timestamps.
+    @Volatile private var cameraInputFps = 0.0
+    @Volatile private var arCorePoseFps = 0.0
+    @Volatile private var odometryTxFps = 0.0
+    private var lastCameraTimestampNs = 0L
+    private var lastPoseTimestampNs = 0L
+    private var lastVisionRateUiMs = 0L
 
     // Mode tabs
     private lateinit var modeTabs: Array<TextView>
@@ -210,6 +258,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         setContentView(R.layout.activity_main)
+        setupTerminalLog()
+        AppLog.i(TAG, "MainActivity created")
+        phoneGyroscope = PhoneGyroscope(this).also { gyro ->
+            if (gyro.start()) AppLog.i("PX4 VIO", "Phone gyroscope active: ${gyro.sensorName}")
+            else AppLog.w("PX4 VIO", "Phone gyroscope unavailable; angular rates will be NaN")
+        }
+        setupPx4UsbAutoConnect()
+        startVioOdometrySender()
         setupWheelEncoderDebug()
 
         if (!checkPermissions()) {
@@ -354,6 +410,11 @@ class MainActivity : AppCompatActivity() {
         colorBar = findViewById(R.id.color_bar)
         presetButtons = findViewById(R.id.preset_buttons)
         zoomSliderContainer = findViewById(R.id.zoom_slider_container)
+        px4Container = findViewById(R.id.px4_container)
+        px4StatusText = findViewById(R.id.px4_status_text)
+        px4TelemetryText = findViewById(R.id.px4_telemetry_text)
+        visionRateText = findViewById(R.id.vision_rate_text)
+        odomContainer = findViewById(R.id.odom_container)
 
         // 3D viewpoint presets
         findViewById<TextView>(R.id.btn_preset_front).setOnClickListener {
@@ -402,7 +463,9 @@ class MainActivity : AppCompatActivity() {
         val tabDepth = findViewById<TextView>(R.id.tab_depth)
         val tabCompare = findViewById<TextView>(R.id.tab_compare)
         val tab3d = findViewById<TextView>(R.id.tab_3d)
-        modeTabs = arrayOf(tabSplit, tabOverlay, tabDepth, tabCompare, tab3d)
+        val tabPx4 = findViewById<TextView>(R.id.tab_px4)
+        val tabOdom = findViewById<TextView>(R.id.tab_odom)
+        modeTabs = arrayOf(tabSplit, tabOverlay, tabDepth, tabCompare, tab3d, tabPx4, tabOdom)
 
         if (flirSdkReady) {
             flirCameraController = FlirCameraController(
@@ -466,6 +529,10 @@ class MainActivity : AppCompatActivity() {
             tab.setOnClickListener {
                 viewMode = index
                 updateViewMode()
+                if (index == VIEW_PX4 && px4MavlinkManager?.isConnected() != true) {
+                    AppLog.i("PX4 USB", "PX4 tab selected: scanning device and requesting permission")
+                    px4UsbAutoConnector?.retryConnection()
+                }
             }
         }
 
@@ -571,6 +638,114 @@ class MainActivity : AppCompatActivity() {
         // Set up frame callback
         arCoreRenderer.onNewFrame = { frame -> processFrame(frame) }
         isUIReady = true
+    }
+
+    private fun setupPx4UsbAutoConnect() {
+        px4UsbAutoConnector = Px4UsbAutoConnector(
+            context = this,
+            onDeviceReady = { device ->
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        if (px4MavlinkManager == null) {
+                            px4MavlinkManager = Px4MavlinkManager(this@MainActivity, lifecycleScope,
+                        object : Px4MavlinkManager.Listener {
+                            override fun onLinkState(state: Px4MavlinkManager.State, detail: String) {
+                                AppLog.i("PX4", "$state${if (detail.isBlank()) "" else " - $detail"}")
+                                runOnUiThread {
+                                    if (::px4StatusText.isInitialized) {
+                                        px4StatusText.text = "${state.name}: ${detail.ifBlank { "No detail" }}"
+                                        px4StatusText.setTextColor(
+                                            if (state == Px4MavlinkManager.State.ERROR) 0xFFFF7777.toInt()
+                                            else 0xFF80E0A0.toInt()
+                                        )
+                                    }
+                                }
+                            }
+                            override fun onMessage(message: io.dronefleet.mavlink.MavlinkMessage<*>) {
+                                px4RxMessageCount++
+                                px4LastMessageName = message.payload.javaClass.simpleName
+                                runOnUiThread {
+                                    if (::px4TelemetryText.isInitialized) {
+                                        px4TelemetryText.text = "RX messages: $px4RxMessageCount\nLast: $px4LastMessageName"
+                                    }
+                                }
+                                val now = android.os.SystemClock.elapsedRealtime()
+                                // Position/target streams are high-rate and otherwise
+                                // hide useful diagnostic messages in the terminal.
+                                val isPositionStream = px4LastMessageName.contains("Position", ignoreCase = true)
+                                if (!isPositionStream && now - lastPx4MessageLogMs >= 5000L) {
+                                    lastPx4MessageLogMs = now
+                                    AppLog.d("PX4", "RX ${message.payload.javaClass.simpleName}")
+                                }
+                            }
+                            override fun onError(error: Throwable) { AppLog.e("PX4", "MAVLink error", error) }
+                            })
+                        }
+                        px4MavlinkManager?.connectUsb(device)
+                    } catch (error: Throwable) {
+                        AppLog.e("PX4", "USB connection failed; app remains running", error)
+                    }
+                }
+            },
+            onStatus = { status -> AppLog.i("PX4 USB", status) }
+        )
+        px4UsbAutoConnector?.start()
+    }
+
+    private fun setupTerminalLog() {
+        terminalOverlay = findViewById(R.id.terminal_overlay)
+        terminalText = findViewById(R.id.terminal_text)
+        terminalScroll = findViewById(R.id.terminal_scroll)
+        val terminalToggle = findViewById<TextView>(R.id.btn_toggle_terminal)
+        terminalToggle.setOnClickListener {
+            terminalOverlay.visibility = if (terminalOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            terminalToggle.visibility = if (terminalOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            if (terminalOverlay.visibility == View.VISIBLE) terminalScroll.post { terminalScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+        findViewById<View>(R.id.btn_close_terminal).setOnClickListener {
+            terminalOverlay.visibility = View.GONE
+            terminalToggle.visibility = View.VISIBLE
+        }
+        findViewById<View>(R.id.btn_copy_terminal).setOnClickListener { saveTerminalLog() }
+        findViewById<View>(R.id.btn_clear_terminal).setOnClickListener { AppLog.clear() }
+        lifecycleScope.launch {
+            AppLog.text.collectLatest { text ->
+                terminalText.text = text
+                if (terminalOverlay.visibility == View.VISIBLE) {
+                    terminalScroll.post { terminalScroll.fullScroll(View.FOCUS_DOWN) }
+                }
+            }
+        }
+    }
+
+    private fun saveTerminalLog() {
+        val log = AppLog.snapshot()
+        if (log.isBlank()) {
+            Toast.makeText(this, "No logs to save", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("PTC-Depth log", log))
+
+        val filename = "ptc_depth_log_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.txt"
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, filename)
+            put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+            put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        if (uri == null) {
+            AppLog.e(TAG, "Failed to create log file")
+            Toast.makeText(this, "Log copied, but file creation failed", Toast.LENGTH_LONG).show()
+            return
+        }
+        try {
+            contentResolver.openOutputStream(uri)?.use { it.write(log.toByteArray(Charsets.UTF_8)) }
+            Toast.makeText(this, "Copied and saved to Downloads/$filename", Toast.LENGTH_LONG).show()
+        } catch (error: Throwable) {
+            AppLog.e(TAG, "Failed to write log file", error)
+            Toast.makeText(this, "Log copied, but file write failed", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun updateFlirRenderControls(fieldscaleEnabled: Boolean) {
@@ -923,7 +1098,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupWheelEncoderDebug() {
-        textWheelEncoder = findViewById(R.id.text_wheel_encoder)
+        textWheelEncoder = findViewById(R.id.odom_text)
         gsUsbCanReceiver = GsUsbCanReceiver(this, object : GsUsbCanReceiver.Listener {
             override fun onStatus(status: String) {
                 usbCanStatus = status
@@ -1167,6 +1342,8 @@ class MainActivity : AppCompatActivity() {
     // ========================================================================
 
     private fun updateViewMode() {
+        px4Container.visibility = View.GONE
+        odomContainer.visibility = View.GONE
         when (viewMode) {
             VIEW_SPLIT -> {
                 splitContainer.visibility = View.VISIBLE
@@ -1212,6 +1389,24 @@ class MainActivity : AppCompatActivity() {
                 depthVisualizerOverlay.visibility = View.GONE
                 pointCloudView.visibility = View.GONE
                 flirDepthVisualizer.visibility = View.VISIBLE
+            }
+            VIEW_PX4 -> {
+                splitContainer.visibility = View.GONE
+                compareContainer.visibility = View.GONE
+                cameraView.visibility = View.GONE
+                depthVisualizerOverlay.visibility = View.GONE
+                pointCloudView.visibility = View.GONE
+                flirDepthVisualizer.visibility = View.GONE
+                px4Container.visibility = View.VISIBLE
+            }
+            VIEW_ODOM -> {
+                splitContainer.visibility = View.GONE
+                compareContainer.visibility = View.GONE
+                cameraView.visibility = View.GONE
+                depthVisualizerOverlay.visibility = View.GONE
+                pointCloudView.visibility = View.GONE
+                flirDepthVisualizer.visibility = View.GONE
+                odomContainer.visibility = View.VISIBLE
             }
         }
 
@@ -1493,10 +1688,124 @@ class MainActivity : AppCompatActivity() {
         } catch (_: Throwable) {
             frame.getTimestamp()
         }
+        if (lastPoseTimestampNs > 0L) {
+            val dt = timestampNs - lastPoseTimestampNs
+            if (dt > 0L) {
+                val instant = 1_000_000_000.0 / dt.toDouble()
+                arCorePoseFps = if (arCorePoseFps <= 0.0) instant else arCorePoseFps * 0.8 + instant * 0.2
+            }
+        }
+        lastPoseTimestampNs = timestampNs
+        vioSampleChannel.trySend(makeVioSample(pose, timestampNs))
         synchronized(arCorePoseLock) {
             arCorePoseBuffer.addLast(TimedArCorePose(timestampNs, pose))
             while (arCorePoseBuffer.size > maxArCorePoseBufferSize) {
                 arCorePoseBuffer.removeFirst()
+            }
+        }
+    }
+
+    /** Convert ARCore camera pose (x-right, y-up, z-back) to PX4 local FRD. */
+    private fun makeVioSample(pose: CameraPose, timestampNs: Long): VioSample {
+        val t = pose.translation
+        val x = -t[2]
+        val y = t[0]
+        val z = -t[1]
+
+        // Basis B maps phone/world axes (right, up, back) to PX4 (forward, right, down).
+        val b = floatArrayOf(0f, 0f, -1f, 1f, 0f, 0f, 0f, -1f, 0f)
+        val bt = floatArrayOf(0f, 1f, 0f, 0f, 0f, -1f, -1f, 0f, 0f)
+        val br = multiply3x3(b, pose.rotation)
+        val r = multiply3x3(br, bt)
+        val q = matrixToQuaternion(r) // xyzw
+
+        val old = previousVioSample
+        val dt = if (old != null) (timestampNs / 1_000_000.0 - old.timestampUs / 1_000_000.0).toFloat() else 0f
+        val vx = if (old != null && dt > 0.001) (x - old.x) / dt else 0f
+        val vy = if (old != null && dt > 0.001) (y - old.y) / dt else 0f
+        val vz = if (old != null && dt > 0.001) (z - old.z) / dt else 0f
+        val gyro = phoneGyroscope?.bodyRatesClosestTo(timestampNs)
+        val sample = VioSample(
+            timestampNs / 1_000L, x, y, z, q[0], q[1], q[2], q[3], vx, vy, vz,
+            gyro?.roll ?: Float.NaN,
+            gyro?.pitch ?: Float.NaN,
+            gyro?.yaw ?: Float.NaN
+        )
+        previousVioSample = sample
+        return sample
+    }
+
+    private fun multiply3x3(a: FloatArray, b: FloatArray): FloatArray {
+        val out = FloatArray(9)
+        for (row in 0..2) for (col in 0..2) {
+            out[row * 3 + col] = a[row * 3] * b[col] +
+                a[row * 3 + 1] * b[3 + col] + a[row * 3 + 2] * b[6 + col]
+        }
+        return out
+    }
+
+    private fun matrixToQuaternion(m: FloatArray): FloatArray {
+        val trace = m[0] + m[4] + m[8]
+        val q = FloatArray(4)
+        if (trace > 0f) {
+            val s = kotlin.math.sqrt(trace + 1f) * 2f
+            q[3] = 0.25f * s; q[0] = (m[7] - m[5]) / s; q[1] = (m[2] - m[6]) / s; q[2] = (m[3] - m[1]) / s
+        } else if (m[0] > m[4] && m[0] > m[8]) {
+            val s = kotlin.math.sqrt(1f + m[0] - m[4] - m[8]) * 2f
+            q[3] = (m[7] - m[5]) / s; q[0] = 0.25f * s; q[1] = (m[1] + m[3]) / s; q[2] = (m[2] + m[6]) / s
+        } else if (m[4] > m[8]) {
+            val s = kotlin.math.sqrt(1f + m[4] - m[0] - m[8]) * 2f
+            q[3] = (m[2] - m[6]) / s; q[0] = (m[1] + m[3]) / s; q[1] = 0.25f * s; q[2] = (m[5] + m[7]) / s
+        } else {
+            val s = kotlin.math.sqrt(1f + m[8] - m[0] - m[4]) * 2f
+            q[3] = (m[3] - m[1]) / s; q[0] = (m[2] + m[6]) / s; q[1] = (m[5] + m[7]) / s; q[2] = 0.25f * s
+        }
+        return q
+    }
+
+    private fun startVioOdometrySender() {
+        vioTxJob?.cancel()
+        vioTxJob = lifecycleScope.launch(Dispatchers.IO) {
+            var rateWindowStartNs = 0L
+            var rateWindowCount = 0L
+            var lastErrorLogNs = 0L
+            for (sample in vioSampleChannel) {
+                if (!isActive) break
+                val manager = px4MavlinkManager
+                if (manager != null && manager.isConnected()) {
+                    try {
+                        manager.sendRawOdometry(
+                            timestampUs = manager.toPx4TimestampUs(sample.timestampUs),
+                            x = sample.x, y = sample.y, z = sample.z,
+                            qw = sample.qw, qx = sample.qx, qy = sample.qy, qz = sample.qz,
+                            vx = sample.vx, vy = sample.vy, vz = sample.vz,
+                            rollSpeed = sample.rollSpeed,
+                            pitchSpeed = sample.pitchSpeed,
+                            yawSpeed = sample.yawSpeed,
+                        )
+                        val nowNs = System.nanoTime()
+                        if (rateWindowStartNs == 0L) rateWindowStartNs = nowNs
+                        rateWindowCount++
+                        if (nowNs - rateWindowStartNs >= 5_000_000_000L) {
+                            val txHz = rateWindowCount * 1_000_000_000.0 / (nowNs - rateWindowStartNs).coerceAtLeast(1L)
+                            odometryTxFps = txHz
+                            rateWindowStartNs = nowNs
+                            rateWindowCount = 0L
+                            AppLog.i(
+                                "PX4 VIO",
+                                "ODOMETRY TX %.1fHz pos=(%.2f, %.2f, %.2f)".format(
+                                    Locale.US, txHz, sample.x, sample.y, sample.z
+                                )
+                            )
+                        }
+                    } catch (error: Throwable) {
+                        val nowNs = System.nanoTime()
+                        if (nowNs - lastErrorLogNs >= 5_000_000_000L) {
+                            lastErrorLogNs = nowNs
+                            AppLog.e("PX4 VIO", "ODOMETRY send failed", error)
+                        }
+                    }
+                }
             }
         }
     }
@@ -1538,6 +1847,20 @@ class MainActivity : AppCompatActivity() {
             val image = frame.acquireCameraImage()
             localCamW = image.width
             localCamH = image.height
+            val cameraTimestampNs = try {
+                frame.getAndroidCameraTimestamp()
+            } catch (_: Throwable) {
+                frame.getTimestamp()
+            }
+            if (lastCameraTimestampNs > 0L) {
+                val dt = cameraTimestampNs - lastCameraTimestampNs
+                if (dt > 0L) {
+                    val instant = 1_000_000_000.0 / dt.toDouble()
+                    cameraInputFps = if (cameraInputFps <= 0.0) instant else cameraInputFps * 0.8 + instant * 0.2
+                }
+            }
+            lastCameraTimestampNs = cameraTimestampNs
+            updateVisionRateUi()
 
             val yPlane = image.planes[0]
             val uPlane = image.planes[1]
@@ -2296,6 +2619,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateVisionRateUi() {
+        val now = System.currentTimeMillis()
+        if (now - lastVisionRateUiMs < 250L || !::visionRateText.isInitialized) return
+        lastVisionRateUiMs = now
+        runOnUiThread {
+            val ts = px4MavlinkManager?.timesyncStatus() ?: "TS --"
+            visionRateText.text = "CAM %.1fHz  AR %.1fHz  TX %.1fHz  $ts".format(
+                Locale.US, cameraInputFps, arCorePoseFps, odometryTxFps
+            )
+        }
+    }
+
     private fun pushFieldscaleConfig() {
         if (!::settingsOverlay.isInitialized) return
         val maxDiff = findViewById<SeekBar>(R.id.seek_fs_max_diff).progress / 2f
@@ -2315,6 +2650,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        phoneGyroscope?.stop()
+        phoneGyroscope = null
+        px4UsbAutoConnector?.stop()
+        px4UsbAutoConnector = null
+        px4MavlinkManager?.stop()
+        px4MavlinkManager = null
         gsUsbCanReceiver?.stop()
         gsUsbCanReceiver = null
         flirPtcMgr?.destroy()
@@ -2407,6 +2748,8 @@ class MainActivity : AppCompatActivity() {
         private const val VIEW_DEPTH = 2
         private const val VIEW_COMPARE = 3
         private const val VIEW_3D = 4
+        private const val VIEW_PX4 = 5
+        private const val VIEW_ODOM = 6
         // Thermal camera modes are not exposed in the UI.
         private const val VIEW_FLIR = 99
     }

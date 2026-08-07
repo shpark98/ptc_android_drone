@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- PX4 standard VID plus the primary KoaFC USB ID observed in the logs. -->
+    <usb-device vendor-id="9900" />
+    <usb-device vendor-id="12642" product-id="75" />
+</resources>

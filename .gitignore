@@ -56,3 +56,8 @@ Thumbs.db
 
 # Compile logs
 compile_*.txt
+
+# Local PX4/PTC diagnostic captures
+/android/ptc_depth_log_*.txt
+/android/ptc_latest_*.txt
+/android/px4_debug_*.txt
